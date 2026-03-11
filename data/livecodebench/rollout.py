@@ -17,6 +17,10 @@ def rollout(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    gc_was_enabled = model.is_gradient_checkpointing
+    if gc_was_enabled:
+        model.gradient_checkpointing_disable()
+
     question = example["question"]
     messages = [{"role": "user", "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{question}"}]
 
@@ -48,5 +52,8 @@ def rollout(
     } for completion in completions]
 
     tokenizer.padding_side = original_padding_side
+
+    if gc_was_enabled:
+        model.gradient_checkpointing_enable()
 
     return results

@@ -237,7 +237,6 @@ def run_test_cases(
 
 
 def get_environment_feedback(
-    prompt: str,
     completion: str,
     example: Dict[str, Any],
     timeout_seconds: int = 10
