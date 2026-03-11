@@ -8,11 +8,8 @@ from datasets import Dataset
 from huggingface_hub import hf_hub_download
 
 
-def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    result = {}
-    for key in batch[0].keys():
-        result[key] = [item[key] for item in batch]
-    return result
+def collate_fn(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return batch
 
 
 class LiveCodeBenchDataset:
@@ -33,7 +30,7 @@ class LiveCodeBenchDataset:
         self._dataset = self._load_dataset()
         self._dataset = self._dataset.map(self._load_tests)
 
-        if susbet_size:
+        if subset_size:
             self._dataset = self._dataset.select(
                 range(min(subset_size, len(self._dataset))))
 

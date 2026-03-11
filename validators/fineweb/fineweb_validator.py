@@ -7,7 +7,7 @@ from datasets import load_dataset, Dataset
 from validators.validator import Validator
 
 
-class FinewebValidator(Validator):
+class FineWebValidator(Validator):
     def __init__(self):
         super().__init__("fineweb")
 
