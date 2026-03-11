@@ -1,25 +1,7 @@
-import os
-import logging
-import torch
-import torch.nn.functional as F
-from datetime import datetime
-from dataclasses import dataclass
-from collections import defaultdict
-from typing import Dict, Any, List, Tuple, Callable
-from torch.utils.data import DataLoader
-from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from accelerate import Accelerator, GradientAccumulationPlugin
-from training.common import ValidatorRunConfig
-from training.utils import get_world_size, get_logits_completion_ids_and_mask, build_student_messages, build_teacher_messages
-from training.sdpo.EMATeacher import EMATeacher
-from training.sdpo.validators import Validator
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
-class SDPOHparams:
+class KDPOHparams:
     learning_rate: float = 1e-6
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
@@ -27,49 +9,147 @@ class SDPOHparams:
     num_epochs: int = 1
     minibatch_size: int = 1
     gradient_accumulation_steps: int = 32
-    num_rollouts: int = 8
+    num_rollouts: int = 4
 
     max_prompt_length: int = 2048
     max_response_length: int = 8192
 
-    teacher_alpha: float = 0.01
     top_k: int = 20
     temperature: float = 1.0
+    beta: float = 0.5
 
     log_interval: int = 10
     validation_interval: int = 10
 
 
-def compute_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
+def calculate_loss(
+    student_logits_y: torch.Tensor,
+    student_logits_y_hat: torch.Tensor,
+    completion_ids_y: torch.Tensor,
+    teacher_logits_y: torch.Tensor,
+    teacher_logits_y_hat: torch.Tensor,
+    completion_ids_y_hat: torch.Tensor,
     mask: torch.Tensor,
-    k: int = 20
+    k: int = 20,
+    beta: float = 0.5
 ) -> torch.Tensor:
-    student_topk_logits, student_topk_indices = torch.topk(
-        student_logits, k, dim=-1)
-    teacher_logits_at_topk_indices = torch.gather(
-        teacher_logits, dim=-1, index=student_topk_indices)
+    student_topk_logits_y, student_topk_indices_y = torch.topk(
+        student_logits_y, k, dim=-1)
+    teacher_logits_y_at_topk_indices = torch.gather(
+        teacher_logits_y, dim=-1, index=student_topk_indices_y)
 
-    s_probs = F.softmax(student_topk_logits, dim=-1)
-    s_log_probs = F.log_softmax(student_topk_logits, dim=-1)
-    t_log_probs = F.log_softmax(teacher_logits_at_topk_indices, dim=-1)
+    teacher_topk_logits_y_hat, teacher_topk_indices_y_hat = torch.topk(
+        teacher_logits_y_hat, k, dim=-1)
+    student_logits_y_hat_at_topk_indices = torch.gather(
+        student_logits_y_hat, dim=-1, index=teacher_topk_indices_y_hat)
 
-    return ((s_probs * (s_log_probs - t_log_probs)).sum(dim=-1) * mask).sum() / mask.sum().clamp(min=1.0)
+    student_logprobs_y = F.log_softmax(student_logits_y, dim=-1)
+    student_logprobs_y_hat = F.log_softmax(student_logits_y_hat, dim=-1)
+    teacher_logprobs_y = F.log_softmax(teacher_logits_y, dim=-1)
+    teacher_logprobs_y_hat = F.log_softmax(teacher_logits_y_hat, dim=-1)
+
+    student_completion_logprobs_y = torch.gather(
+        student_logprobs_y, dim=-1, index=completion_ids_y)
+    student_completion_logprobs_y_hat = torch.gather(
+        student_logprobs_y_hat, dim=-1, index=completion_ids_y_hat)
+    teacher_completion_logprobs_y = torch.gather(
+        teacher_logprobs_y, dim=-1, index=completion_ids_y)
+    teacher_completion_logprobs_y_hat = torch.gather(
+        teacher_logprobs_y_hat, dim=-1, index=completion_ids_y_hat)
+
+    y_hat_relative_logprobs = student_completion_logprobs_y_hat - \
+        teacher_completion_logprobs_y_hat
+    y_relative_logprobs = student_completion_logprobs_y - teacher_completion_logprobs_y
+
+    student_topk_probs_y_hat = F.softmax(
+        student_logits_y_hat_at_topk_indices, dim=-1)
+    student_topk_logprobs_y_hat = F.log_softmax(
+        student_logits_y_hat_at_topk_indices, dim=-1)
+    teacher_topk_logprobs_y_hat = F.log_softmax(
+        teacher_topk_logits_y_hat, dim=-1)
+    kl_y_hat = (student_topk_probs_y_hat * (student_topk_logprobs_y_hat -
+                teacher_topk_logprobs_y_hat)).sum(dim=-1)
+
+    student_topk_probs_y = F.softmax(student_topk_logits_y, dim=-1)
+    student_topk_logprobs_y = F.log_softmax(
+        student_topk_logits_y, dim=-1)
+    teacher_topk_logprobs_y = F.log_softmax(
+        teacher_logits_y_at_topk_indices, dim=-1)
+    kl_y = (student_topk_probs_y * (student_topk_logprobs_y -
+            teacher_topk_logprobs_y)).sum(dim=-1)
+
+    return -F.logsigmoid(beta * ((y_hat_relative_logprobs *
+                                 kl_y_hat) - (y_relative_logprobs * kl_y))).mean()
+
+
+def teacher_rollout(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    example: Dict[str, Any],
+    rollouts: List[Any],
+    feedbacks: List[Any],
+    temperature: float = 1.0,
+    max_new_tokens: int = 2048
+) -> List[Dict[str, Any]]:
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    gc_was_enabled = model.is_gradient_checkpointing
+    if gc_was_enabled:
+        model.gradient_checkpointing_disable()
+
+    question = example["question"]
+    prompts = [build_teacher_prompt(question, rollout.completion, feedback.feedback_text)
+               for rollout, feedback in zip(rollouts, feedbacks)]
+    inputs = tokenizer.apply_chat_template(
+        prompts, add_generation_prompt=True, tokenize=False, padding=True, return_tensors="pt", return_in_dict=True).to(model.device)
+
+    do_sample = temperature > 0.0
+
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "num_return_sequences": len(rollouts),
+        "do_sample": do_sample
+    }
+    if do_sample:
+        generation_kwargs["temperature"] = temperature
+        generation_kwargs["top_p"] = 0.95
+
+    with torch.no_grad():
+        outputs = model.generate(**inputs, **generation_kwargs)
+
+    completions = tokenizer.batch_decode(
+        outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    results = [{
+        "prompt": prompt,
+        "completion": completion
+    } for prompt, completion in zip(prompts, completions)]
+
+    tokenizer.padding_side = original_padding_side
+
+    if gc_was_enabled:
+        model.gradient_checkpointing_enable()
+
+    return results
 
 
 def train(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     dataset: Dataset,
-    hparams: SDPOHparams,
+    hparams: KDPOHparams,
     collate_fn: Callable,
     rollout_fn: Callable,
     get_feedback_fn: Callable,
     validators: List[Tuple[Validator, ValidatorRunConfig]],
-    output_dir: str = "outputs/sdpo",
+    output_dir: str = "outputs/kdpo",
     wandb_project: str = "kdpo-exploration",
-    wandb_run_name: str = "sdpo",
+    wandb_run_name: str = "kdpo",
 ) -> Dict[str, Any]:
     output_dir = f"{output_dir}/{wandb_run_name}/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(output_dir, exist_ok=True)
@@ -97,9 +177,9 @@ def train(
                 "num_rollouts": hparams.num_rollouts,
                 "max_prompt_length": hparams.max_prompt_length,
                 "max_response_length": hparams.max_response_length,
-                "teacher_alpha": hparams.teacher_alpha,
                 "top_k": hparams.top_k,
                 "temperature": hparams.temperature,
+                "beta": hparams.beta,
             },
             init_kwargs={
                 "wandb": {"name": wandb_run_name}
@@ -117,10 +197,6 @@ def train(
 
     model, optimizer, dataloader = accelerator.prepare(
         model, optimizer, dataloader)
-
-    teacher = EMATeacher(accelerator.unwrap_model(model),
-                         alpha=hparams.teacher_alpha)
-
     model.train()
 
     global_step = 0
@@ -137,9 +213,9 @@ def train(
         logger.info(f"Number of rollouts: {hparams.num_rollouts}")
         logger.info(f"Max prompt length: {hparams.max_prompt_length}")
         logger.info(f"Max response length: {hparams.max_response_length}")
-        logger.info(f"Teacher alpha: {hparams.teacher_alpha}")
         logger.info(f"Top k: {hparams.top_k}")
         logger.info(f"Temperature: {hparams.temperature}")
+        logger.info(f"Beta: {hparams.beta}")
 
     for epoch in range(hparams.num_epochs):
         if accelerator.is_main_process:
@@ -164,29 +240,51 @@ def train(
                     feedbacks = [get_feedback_fn(
                         rollout.completion, example) for rollout in rollouts]
 
+                    teacher_rollouts = teacher_rollout(
+                        accelerator.unwrap_model(model),
+                        tokenizer,
+                        example,
+                        rollouts,
+                        feedbacks,
+                        temperature=hparams.temperature,
+                        max_new_tokens=hparams.max_response_length
+                    )
+
                     batch_data.extend([{
                         "example": example,
                         "rollout": rollout,
-                        "feedback": feedback
-                    } for rollout, feedback in zip(rollouts, feedbacks)])
+                        "feedback": feedback,
+                        "teacher_rollout": teacher_rollout
+                    } for rollout, feedback, teacher_rollout in zip(rollouts, feedbacks, teacher_rollouts)])
 
-                student_logits, _, student_masks = get_logits_completion_ids_and_mask(
+                student_messages = [build_student_messages(data["example"]["question"], data["rollout"].completion) for data in batch_data] + [
+                    build_student_messages(data["example"]["question"], data["teacher_rollout"].completion) for data in batch_data]
+                student_logits, completion_ids, masks = get_logits_completion_ids_and_mask(
                     model,
                     tokenizer,
-                    [build_student_messages(
-                        data["example"]["question"], data["rollout"].completion) for data in batch_data],
+                    student_messages,
                     requires_grad=True
                 )
+
+                teacher_messages = [build_teacher_messages(data["example"]["question"], data["rollout"].completion, data["feedback"].feedback_text, data["rollout"].completion) for data in batch_data] + [
+                    build_teacher_messages(data["example"]["question"], data["rollout"].completion, data["feedback"].feedback_text, data["teacher_rollout"].completion) for data in batch_data]
                 teacher_logits, _, _ = get_logits_completion_ids_and_mask(
                     teacher,
                     tokenizer,
-                    [build_teacher_messages(data["example"]["question"], data["rollout"].completion, data["feedback"].feedback_text,
-                                            data["rollout"].completion) for data in batch_data],
+                    teacher_messages,
                     requires_grad=False
                 )
 
-                loss = compute_loss(student_logits, teacher_logits,
-                                    student_masks, hparams.top_k)
+                student_logits_y = student_logits[:len(batch_data)]
+                student_logits_y_hat = student_logits[len(batch_data):]
+                completion_ids_y = completion_ids[:len(batch_data)]
+                teacher_logits_y = teacher_logits[:len(batch_data)]
+                teacher_logits_y_hat = teacher_logits[len(batch_data):]
+                completion_ids_y_hat = completion_ids[len(batch_data):]
+                mask = masks[:len(batch_data)]
+
+                loss = calculate_loss(student_logits_y, student_logits_y_hat, completion_ids_y, teacher_logits_y,
+                                      teacher_logits_y_hat, completion_ids_y_hat, mask, hparams.top_k, hparams.beta)
 
                 accelerator.backward(loss)
 
@@ -197,8 +295,6 @@ def train(
 
                     optimizer.step()
                     optimizer.zero_grad()
-
-                    teacher.update(accelerator.unwrap_model(model))
 
                     global_step += 1
                     total_loss += loss.item()
@@ -211,7 +307,7 @@ def train(
                             "train/loss": loss.item(),
                             "train/global_step": global_step,
                             "train/learning_rate": optimizer.param_groups[0]["lr"],
-                            "train/completion_tokens": student_masks.sum().item(),
+                            "train/completion_tokens": masks.sum().item(),
                         }
                         accelerator.log(log_dict, step=global_step)
 
@@ -299,15 +395,15 @@ if __name__ == "__main__":
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--minibatch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
-    parser.add_argument("--num-rollouts", type=int, default=8)
+    parser.add_argument("--num-rollouts", type=int, default=4)
     parser.add_argument("--max-prompt-length", type=int, default=2048)
     parser.add_argument("--max-response-length", type=int, default=8192)
-    parser.add_argument("--teacher-alpha", type=float, default=0.01)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=0.5)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--validation-interval", type=int, default=10)
-    parser.add_argument("--output-dir", type=str, default="outputs/sdpo")
+    parser.add_argument("--output-dir", type=str, default="outputs/kdpo")
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -319,7 +415,7 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    hparams = SDPOHparams(
+    hparams = KDPOHparams(
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
@@ -329,9 +425,9 @@ if __name__ == "__main__":
         num_rollouts=args.num_rollouts,
         max_prompt_length=args.max_prompt_length,
         max_response_length=args.max_response_length,
-        teacher_alpha=args.teacher_alpha,
         top_k=args.top_k,
         temperature=args.temperature,
+        beta=args.beta,
         log_interval=args.log_interval,
         validation_interval=args.validation_interval,
     )

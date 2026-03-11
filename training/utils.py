@@ -3,6 +3,10 @@ from typing import List, Dict, Any, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+def get_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", 1))
+
+
 def get_logits_completion_ids_and_mask(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
