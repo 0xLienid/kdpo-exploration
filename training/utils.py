@@ -1,11 +1,82 @@
 import os
 import torch
+import torch.nn.functional as F
 from typing import List, Dict, Any, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def get_world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", 1))
+
+
+def get_completion_token_logprobs(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    messages: List[List[Dict[str, Any]]],
+    max_seq_length: int,
+    requires_grad: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    device = next(model.parameters()).device
+
+    prompt_texts = [
+        tokenizer.apply_chat_template(
+            [conversation[0]],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        for conversation in messages
+    ]
+    full_texts = [
+        tokenizer.apply_chat_template(conversation, tokenize=False)
+        for conversation in messages
+    ]
+
+    prompt_encodings = tokenizer(
+        prompt_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_seq_length,
+    ).to(device)
+    full_encodings = tokenizer(
+        full_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_seq_length,
+    ).to(device)
+
+    prompt_lengths = prompt_encodings["attention_mask"].sum(dim=-1)
+    sequence_lengths = full_encodings["attention_mask"].sum(dim=-1)
+
+    if requires_grad:
+        outputs = model(**full_encodings)
+    else:
+        with torch.no_grad():
+            outputs = model(**full_encodings)
+
+    logits = outputs.logits.float()
+    shifted_logits = logits[:, :-1, :]
+    shifted_input_ids = full_encodings["input_ids"][:, 1:]
+
+    token_logprobs = F.log_softmax(shifted_logits, dim=-1)
+    token_logprobs = torch.gather(
+        token_logprobs, dim=-1, index=shifted_input_ids.unsqueeze(-1)
+    ).squeeze(-1)
+
+    positions = torch.arange(
+        full_encodings["input_ids"].shape[-1], device=device
+    ).unsqueeze(0)
+    completion_mask = (
+        (positions >= prompt_lengths.unsqueeze(1))
+        & (positions < sequence_lengths.unsqueeze(1))
+    )
+    token_mask = completion_mask[:, 1:] & (full_encodings["attention_mask"][:, 1:] > 0)
+
+    return token_logprobs, token_mask
 
 
 def get_logits_completion_ids_and_mask(
