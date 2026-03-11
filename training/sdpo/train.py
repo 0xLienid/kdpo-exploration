@@ -13,7 +13,7 @@ from accelerate import Accelerator, GradientAccumulationPlugin
 from training.common import ValidatorRunConfig
 from training.utils import get_world_size, get_logits_completion_ids_and_mask, build_student_messages, build_teacher_messages
 from training.sdpo.EMATeacher import EMATeacher
-from training.sdpo.validators import Validator
+from validators import Validator
 
 logger = logging.getLogger(__name__)
 

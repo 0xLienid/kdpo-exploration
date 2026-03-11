@@ -1,3 +1,21 @@
+import os
+import math
+import logging
+import torch
+import torch.nn.functional as F
+from datetime import datetime
+from dataclasses import dataclass
+from collections import defaultdict
+from typing import Dict, Any, List, Tuple, Callable
+from torch.utils.data import DataLoader
+from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from accelerate import Accelerator, GradientAccumulationPlugin
+from training.common import ValidatorRunConfig
+from training.utils import get_world_size, get_logits_completion_ids_and_mask, build_student_messages, build_teacher_prompt, build_teacher_messages
+from validators import Validator
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,7 +40,7 @@ class KDPOHparams:
     validation_interval: int = 10
 
 
-def calculate_loss(
+def compute_loss(
     student_logits_y: torch.Tensor,
     student_logits_y_hat: torch.Tensor,
     completion_ids_y: torch.Tensor,
@@ -49,13 +67,13 @@ def calculate_loss(
     teacher_logprobs_y_hat = F.log_softmax(teacher_logits_y_hat, dim=-1)
 
     student_completion_logprobs_y = torch.gather(
-        student_logprobs_y, dim=-1, index=completion_ids_y)
+        student_logprobs_y, dim=-1, index=completion_ids_y.unsqueeze(-1)).squeeze(-1)
     student_completion_logprobs_y_hat = torch.gather(
-        student_logprobs_y_hat, dim=-1, index=completion_ids_y_hat)
+        student_logprobs_y_hat, dim=-1, index=completion_ids_y_hat.unsqueeze(-1)).squeeze(-1)
     teacher_completion_logprobs_y = torch.gather(
-        teacher_logprobs_y, dim=-1, index=completion_ids_y)
+        teacher_logprobs_y, dim=-1, index=completion_ids_y.unsqueeze(-1)).squeeze(-1)
     teacher_completion_logprobs_y_hat = torch.gather(
-        teacher_logprobs_y_hat, dim=-1, index=completion_ids_y_hat)
+        teacher_logprobs_y_hat, dim=-1, index=completion_ids_y_hat.unsqueeze(-1)).squeeze(-1)
 
     y_hat_relative_logprobs = student_completion_logprobs_y_hat - \
         teacher_completion_logprobs_y_hat
@@ -65,10 +83,19 @@ def calculate_loss(
         student_logits_y_hat_at_topk_indices, dim=-1)
     student_topk_logprobs_y_hat = F.log_softmax(
         student_logits_y_hat_at_topk_indices, dim=-1)
+    teacher_topk_probs_y_hat = F.softmax(
+        teacher_topk_logits_y_hat, dim=-1)
     teacher_topk_logprobs_y_hat = F.log_softmax(
         teacher_topk_logits_y_hat, dim=-1)
-    kl_y_hat = (student_topk_probs_y_hat * (student_topk_logprobs_y_hat -
-                teacher_topk_logprobs_y_hat)).sum(dim=-1)
+
+    m = 0.5 * (student_topk_probs_y_hat + teacher_topk_probs_y_hat)
+    log_m = torch.log(m)
+    kl_student_m_y_hat = (student_topk_probs_y_hat *
+                          (student_topk_logprobs_y_hat - log_m)).sum(dim=-1)
+    kl_teacher_m_y_hat = (teacher_topk_probs_y_hat *
+                          (teacher_topk_logprobs_y_hat - log_m)).sum(dim=-1)
+    js = 0.5 * (kl_student_m_y_hat + kl_teacher_m_y_hat)
+    jss = 1 - (js / math.log(2.0))
 
     student_topk_probs_y = F.softmax(student_topk_logits_y, dim=-1)
     student_topk_logprobs_y = F.log_softmax(
@@ -78,8 +105,31 @@ def calculate_loss(
     kl_y = (student_topk_probs_y * (student_topk_logprobs_y -
             teacher_topk_logprobs_y)).sum(dim=-1)
 
-    return -F.logsigmoid(beta * ((y_hat_relative_logprobs *
-                                 kl_y_hat) - (y_relative_logprobs * kl_y))).mean()
+    token_scores = beta * \
+        ((y_hat_relative_logprobs * jss) - (y_relative_logprobs * kl_y))
+    token_loss = -F.logsigmoid(token_scores)
+    mask = mask.to(token_loss.dtype)
+    token_loss = torch.where(mask > 0, token_loss,
+                             torch.zeros_like(token_loss))
+    return token_loss.sum() / mask.sum().clamp(min=1.0)
+
+
+def build_paired_min_masks(student_masks: torch.Tensor) -> torch.Tensor:
+    if student_masks.shape[0] % 2 != 0:
+        raise ValueError(
+            f"Expected an even number of student mask rows, got {student_masks.shape[0]}"
+        )
+
+    pair_count = student_masks.shape[0] // 2
+    paired_min_masks = torch.minimum(
+        student_masks[:pair_count],
+        student_masks[pair_count:],
+    )
+
+    corrected_masks = student_masks.clone()
+    corrected_masks[:pair_count] = paired_min_masks
+    corrected_masks[pair_count:] = paired_min_masks
+    return corrected_masks
 
 
 def teacher_rollout(
@@ -265,6 +315,7 @@ def train(
                     student_messages,
                     requires_grad=True
                 )
+                masks = build_paired_min_masks(masks)
 
                 teacher_messages = [build_teacher_messages(data["example"]["question"], data["rollout"].completion, data["feedback"].feedback_text, data["rollout"].completion) for data in batch_data] + [
                     build_teacher_messages(data["example"]["question"], data["rollout"].completion, data["feedback"].feedback_text, data["teacher_rollout"].completion) for data in batch_data]
@@ -283,8 +334,8 @@ def train(
                 completion_ids_y_hat = completion_ids[len(batch_data):]
                 mask = masks[:len(batch_data)]
 
-                loss = calculate_loss(student_logits_y, student_logits_y_hat, completion_ids_y, teacher_logits_y,
-                                      teacher_logits_y_hat, completion_ids_y_hat, mask, hparams.top_k, hparams.beta)
+                loss = compute_loss(student_logits_y, student_logits_y_hat, completion_ids_y, teacher_logits_y,
+                                    teacher_logits_y_hat, completion_ids_y_hat, mask, hparams.top_k, hparams.beta)
 
                 accelerator.backward(loss)
 
