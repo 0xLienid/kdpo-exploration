@@ -12,8 +12,9 @@ from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import Accelerator
 from accelerate.utils import GradientAccumulationPlugin
+from data.livecodebench import format_question as get_question
 from training.common import ValidatorRunConfig
-from training.utils import gather_completion_span, get_world_size, get_logits_completion_ids_and_mask, build_student_messages, build_teacher_prompt, build_teacher_messages
+from training.utils import get_grad_norm, gather_completion_span, get_world_size, get_logits_completion_ids_and_mask, build_student_messages, build_teacher_prompt, build_teacher_messages
 from validators import Validator
 
 logger = logging.getLogger(__name__)
@@ -39,16 +40,6 @@ class KDPOHparams:
 
     log_interval: int = 10
     validation_interval: int = 10
-
-
-def get_grad_norm(model: torch.nn.Module) -> float:
-    total_sq_norm = 0.0
-    for param in model.parameters():
-        if param.grad is None:
-            continue
-        grad_norm = param.grad.detach().data.norm(2).item()
-        total_sq_norm += grad_norm * grad_norm
-    return math.sqrt(total_sq_norm)
 
 
 def compute_loss(
@@ -145,7 +136,16 @@ def compute_loss(
         ((y_hat_relative_logprobs * jss) - (y_relative_logprobs * kl_y))
     token_loss = -F.logsigmoid(token_scores)
     valid_mask = valid_mask.to(token_loss.dtype)
-    return (token_loss * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+
+    loss = (token_loss * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+
+    metrics = {
+        "y_hat_relative_logprobs": y_hat_relative_logprobs.mean().item(),
+        "y_relative_log_probs": y_relative_logprobs.mean().item(),
+        "y_hatjss": jss.mean().item(),
+        "y_kl": kl_y.mean().item()
+    }
+    return loss, metrics
 
 
 def teacher_rollout(
@@ -168,7 +168,8 @@ def teacher_rollout(
         model.gradient_checkpointing_disable()
 
     question = f"{example['question_title']}:\n{example['question_content']}"
-    prompts = [build_teacher_prompt(question, rollout["completion"], feedback.feedback_text) for rollout, feedback in zip(rollouts, feedbacks)]
+    prompts = [build_teacher_prompt(question, rollout["completion"], feedback.feedback_text)
+               for rollout, feedback in zip(rollouts, feedbacks)]
     inputs = tokenizer.apply_chat_template(
         prompts, add_generation_prompt=True, tokenize=True, padding=True, return_tensors="pt", return_in_dict=True)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
@@ -270,6 +271,7 @@ def train(
 
     if accelerator.is_main_process:
         logger.info("Beginning training...")
+        logger.info(f"World size: {world_size}")
         logger.info(f"Learning rate: {hparams.learning_rate}")
         logger.info(f"Number of training steps: {len(dataloader)}")
         logger.info(f"Number of validation steps: {len(validators)}")
@@ -323,8 +325,8 @@ def train(
                         "teacher_rollout": teacher_rollout
                     } for rollout, feedback, teacher_rollout in zip(rollouts, feedbacks, teacher_rollouts)])
 
-                student_messages = [build_student_messages(f"{data['example']['question_title']}:\n{data['example']['question_content']}", data["rollout"]["completion"]) for data in batch_data] + [
-                    build_student_messages(f"{data['example']['question_title']}:\n{data['example']['question_content']}", data["teacher_rollout"]["completion"]) for data in batch_data]
+                student_messages = [build_student_messages(get_question(data["example"]), data["rollout"]["completion"]) for data in batch_data] + [
+                    build_student_messages(get_question(data["example"]), data["teacher_rollout"]["completion"]) for data in batch_data]
                 student_logits, completion_ids, student_starts, student_lengths = get_logits_completion_ids_and_mask(
                     model,
                     tokenizer,
@@ -357,8 +359,8 @@ def train(
 
                 del student_logits, completion_ids, student_starts
 
-                teacher_messages = [build_teacher_messages(f"{data['example']['question_title']}:\n{data['example']['question_content']}", data["rollout"]["completion"], data["feedback"].feedback_text, data["rollout"]["completion"]) for data in batch_data] + [
-                    build_teacher_messages(f"{data['example']['question_title']}:\n{data['example']['question_content']}", data["rollout"]["completion"], data["feedback"].feedback_text, data["teacher_rollout"]["completion"]) for data in batch_data]
+                teacher_messages = [build_teacher_messages(get_question(data["example"]), data["rollout"]["completion"], data["feedback"].feedback_text, data["rollout"]["completion"]) for data in batch_data] + [
+                    build_teacher_messages(get_question(data["example"]), data["rollout"]["completion"], data["feedback"].feedback_text, data["teacher_rollout"]["completion"]) for data in batch_data]
                 teacher_logits, _, teacher_starts, teacher_lengths = get_logits_completion_ids_and_mask(
                     model,
                     tokenizer,
@@ -381,10 +383,10 @@ def train(
 
                 del teacher_logits, teacher_starts
 
-                loss = compute_loss(student_logits_y, student_logits_y_hat, completion_ids_y, teacher_logits_y,
-                                    teacher_logits_y_hat, completion_ids_y_hat, student_lengths_y,
-                                    student_lengths_y_hat, teacher_lengths_y, teacher_lengths_y_hat,
-                                    hparams.top_k, hparams.beta)
+                loss, metrics = compute_loss(student_logits_y, student_logits_y_hat, completion_ids_y, teacher_logits_y,
+                                             teacher_logits_y_hat, completion_ids_y_hat, student_lengths_y,
+                                             student_lengths_y_hat, teacher_lengths_y, teacher_lengths_y_hat,
+                                             hparams.top_k, hparams.beta)
 
                 accelerator.backward(loss)
 
@@ -413,9 +415,15 @@ def train(
                             "train/global_step": global_step,
                             "train/learning_rate": optimizer.param_groups[0]["lr"],
                             "train/completion_tokens": torch.minimum(
-                                torch.minimum(student_lengths_y, student_lengths_y_hat),
-                                torch.minimum(teacher_lengths_y, teacher_lengths_y_hat),
+                                torch.minimum(student_lengths_y,
+                                              student_lengths_y_hat),
+                                torch.minimum(teacher_lengths_y,
+                                              teacher_lengths_y_hat),
                             ).sum().item(),
+                            "train/y_hat_relative_logprobs": metrics["y_hat_relative_logprobs"],
+                            "train/y_relative_log_probs": metrics["y_relative_log_probs"],
+                            "train/y_hatjss": metrics["y_hatjss"],
+                            "train/y_kl": metrics["y_kl"],
                         }
                         if grad_norm is not None:
                             log_dict["train/grad_norm"] = grad_norm
@@ -430,7 +438,8 @@ def train(
 
                         try:
                             for validator, val_config in validators:
-                                logger.info(f"Validating with {validator.name}...")
+                                logger.info(
+                                    f"Validating with {validator.name}...")
                                 try:
                                     score = validator.validate(
                                         model=unwrapped_model,
@@ -485,7 +494,8 @@ def train(
                     logger.info(
                         f"Final validation score for {validator.name}: {score:.4f}")
                 except Exception as e:
-                    logger.error(f"Error validating with {validator.name}: {e}")
+                    logger.error(
+                        f"Error validating with {validator.name}: {e}")
         finally:
             tokenizer.padding_side = original_padding_side
             tokenizer.pad_token = original_pad_token
@@ -563,7 +573,8 @@ if __name__ == "__main__":
         validation_interval=args.validation_interval,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
     model.gradient_checkpointing_enable()

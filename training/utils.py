@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import torch.nn.functional as F
 from typing import List, Dict, Any, Tuple
@@ -7,6 +8,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def get_world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", 1))
+
+
+def get_grad_norm(model: torch.nn.Module) -> float:
+    total_sq_norm = 0.0
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        grad_norm = param.grad.detach().data.norm(2).item()
+        total_sq_norm += grad_norm * grad_norm
+    return math.sqrt(total_sq_norm)
 
 
 def gather_completion_span(
@@ -101,7 +112,8 @@ def get_completion_token_logprobs(
         (positions >= prompt_lengths.unsqueeze(1))
         & (positions < sequence_lengths.unsqueeze(1))
     )
-    token_mask = completion_mask[:, 1:] & (full_encodings["attention_mask"][:, 1:] > 0)
+    token_mask = completion_mask[:, 1:] & (
+        full_encodings["attention_mask"][:, 1:] > 0)
 
     return token_logprobs, token_mask
 

@@ -12,6 +12,10 @@ def collate_fn(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return batch
 
 
+def format_question(example: Dict[str, Any]) -> str:
+    return f"{example['question_title']}:\n{example['question_content']}"
+
+
 class LiveCodeBenchDataset:
     FILES = [
         "test.jsonl",
