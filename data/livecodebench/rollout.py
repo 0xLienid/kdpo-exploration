@@ -21,7 +21,7 @@ def rollout(
     if gc_was_enabled:
         model.gradient_checkpointing_disable()
 
-    question = example["question"]
+    question = f"{example['question_title']}:\n{example['question_content']}"
     messages = [{"role": "user", "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{question}"}]
 
     prompt = tokenizer.apply_chat_template(

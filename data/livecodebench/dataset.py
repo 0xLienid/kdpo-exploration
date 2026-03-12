@@ -80,3 +80,6 @@ class LiveCodeBenchDataset:
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self._dataset[idx]
+
+    def select(self, indices: List[int]) -> Dataset:
+        return self._dataset.select(indices)

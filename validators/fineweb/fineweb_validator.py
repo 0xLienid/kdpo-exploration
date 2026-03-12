@@ -28,67 +28,75 @@ class FineWebValidator(Validator):
         model.eval()
 
         original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = "left"
-        tokenizer.pad_token = tokenizer.eos_token
+        original_pad_token = tokenizer.pad_token
+        original_pad_token_id = tokenizer.pad_token_id
 
-        dataset_iter = iter(self.test_dataset)
+        try:
+            tokenizer.padding_side = "left"
+            tokenizer.pad_token = tokenizer.eos_token
 
-        total_nll = 0.0
-        total_token_count = 0
+            dataset_iter = iter(self.test_dataset)
 
-        processed_samples = 0
-        while processed_samples < num_samples:
-            batch = []
-            for _ in range(batch_size):
-                if processed_samples >= num_samples:
+            total_nll = 0.0
+            total_token_count = 0
+
+            processed_samples = 0
+            while processed_samples < num_samples:
+                batch = []
+                for _ in range(batch_size):
+                    if processed_samples >= num_samples:
+                        break
+
+                    try:
+                        sample = next(dataset_iter)
+                    except StopIteration:
+                        break
+
+                    batch.append(sample["text"])
+                    processed_samples += 1
+
+                if len(batch) == 0:
                     break
 
-                try:
-                    sample = next(dataset_iter)
-                except StopIteration:
-                    break
+                batch_inputs = tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_seq_length,
+                    padding_side="left",
+                ).to(model.device)
 
-                batch.append(sample["text"])
-                processed_samples += 1
+                labels = batch_inputs["input_ids"].clone()
+                if "attention_mask" in batch_inputs:
+                    labels[batch_inputs["attention_mask"] == 0] = -100
 
-            if len(batch) == 0:
-                break
+                with torch.no_grad():
+                    outputs = model(**batch_inputs)
+                    logits = outputs.logits.float()
 
-            batch_inputs = tokenizer(
-                batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_seq_length,
-                padding_side="left",
-            ).to(model.device)
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = labels[:, 1:].contiguous()
 
-            labels = batch_inputs["input_ids"].clone()
-            if "attention_mask" in batch_inputs:
-                labels[batch_inputs["attention_mask"] == 0] = -100
+                    loss_sum = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
 
-            with torch.no_grad():
-                outputs = model(**batch_inputs)
-                logits = outputs.logits.float()
+                    valid_tokens = (shift_labels != -100).sum().item()
+                    if valid_tokens > 0:
+                        total_nll += loss_sum.item()
+                        total_token_count += valid_tokens
 
-                shift_logits = logits[:, :-1, :].contiguous()
-                shift_labels = labels[:, 1:].contiguous()
+            if total_token_count == 0:
+                return float("inf")
 
-                loss_sum = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                    reduction="sum",
-                )
-
-                valid_tokens = (shift_labels != -100).sum().item()
-                if valid_tokens > 0:
-                    total_nll += loss_sum.item()
-                    total_token_count += valid_tokens
-
-        if total_token_count == 0:
-            return float("inf")
-
-        average_nll = total_nll / total_token_count
-        perplexity = math.exp(average_nll)
-        return perplexity
+            average_nll = total_nll / total_token_count
+            perplexity = math.exp(average_nll)
+            return perplexity
+        finally:
+            tokenizer.padding_side = original_padding_side
+            tokenizer.pad_token = original_pad_token
+            tokenizer.pad_token_id = original_pad_token_id

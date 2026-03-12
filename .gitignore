@@ -11,3 +11,12 @@ wheels/
 
 # Environment variables
 .env
+
+# Data
+data_raw/
+
+# Outputs
+outputs/
+
+# Logging
+wandb/

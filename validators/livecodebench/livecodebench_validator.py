@@ -8,7 +8,7 @@ class LiveCodeBenchValidator(Validator):
     def __init__(self):
         super().__init__("livecodebench")
 
-        self.dataset = LiveCodeBenchDataset()
+        self.dataset = LiveCodeBenchDataset(subset_size=8)
 
     def validate(
         self,

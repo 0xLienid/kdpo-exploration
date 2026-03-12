@@ -9,6 +9,33 @@ def get_world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", 1))
 
 
+def gather_completion_span(
+    tensor: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    pad_value: int | float = 0,
+) -> torch.Tensor:
+    max_length = int(lengths.max().item())
+    if max_length == 0:
+        return tensor[:, :0]
+
+    relative_positions = torch.arange(
+        max_length, device=tensor.device).unsqueeze(0)
+    batch_indices = torch.arange(
+        tensor.shape[0], device=tensor.device).unsqueeze(1)
+    positions = starts.unsqueeze(1) + relative_positions
+    positions = positions.clamp(max=tensor.shape[1] - 1)
+
+    span = tensor[batch_indices, positions]
+    valid_mask = relative_positions < lengths.unsqueeze(1)
+    if span.ndim == 3:
+        span = span.masked_fill(~valid_mask.unsqueeze(-1), pad_value)
+    else:
+        span = span.masked_fill(~valid_mask, pad_value)
+
+    return span
+
+
 def get_completion_token_logprobs(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -84,44 +111,35 @@ def get_logits_completion_ids_and_mask(
     tokenizer: AutoTokenizer,
     messages: List[List[Dict[str, Any]]],
     requires_grad: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    prompt_lengths = [len(tokenizer.apply_chat_template(
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    prompt_lengths = torch.tensor([len(tokenizer.apply_chat_template(
         [conversation[0]],
         add_generation_prompt=True,
         tokenize=True
-    )) for conversation in messages]
+    )["input_ids"]) for conversation in messages], device=model.device, dtype=torch.long)
 
     full_encodings = tokenizer.apply_chat_template(
-        full_messages, tokenize=True, padding=True, return_tensors="pt", return_in_dict=True)
-    completion_lengths = full_encodings["attention_mask"].sum(
-        dim=-1) - torch.tensor(prompt_lengths)
-
+        messages, tokenize=True, padding=True, return_tensors="pt", return_in_dict=True)
     full_encodings = {k: v.to(model.device) for k, v in full_encodings.items()}
+    input_ids = full_encodings["input_ids"]
+    attention_mask = full_encodings["attention_mask"]
+    sequence_lengths = attention_mask.sum(dim=-1)
 
     if requires_grad:
         outputs = model(**full_encodings)
     else:
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model(**full_encodings)
 
-    max_completion_length = completion_lengths.max().item()
-    logits = torch.zeros(
-        (outputs.logits.shape[0], max_completion_length, outputs.logits.shape[-1]), device=model.device)
-    completion_ids = torch.full(
-        (outputs.logits.shape[0], max_completion_length), tokenizer.pad_token_id, device=model.device)
-    mask = torch.zeros(
-        (outputs.logits.shape[0], max_completion_length), device=model.device)
+    logits = outputs.logits[:, :-1, :]
+    completion_ids = input_ids[:, 1:].to(torch.int64)
+    completion_starts = prompt_lengths - 1
+    completion_lengths = sequence_lengths - prompt_lengths
 
-    for i in range(len(messages)):
-        end_idx = prompt_lengths[i] + completion_lenghs[i] - 1
-        logits[i, :completion_lengths[i], :] = outputs.logits[i,
-                                                              prompt_lengths[i] - 1:end_idx, :]
-        completion_ids[i, :completion_lengths[i]] = full_encodings["input_ids"][i,
-                                                                                prompt_lengths[i]:end_idx + 1].to(torch.int64)
-        mask[i, :completion_lengths[i]] = full_encodings["attention_mask"][i,
-                                                                           prompt_lengths[i]:end_idx + 1]
-
-    return logits, completion_ids, mask
+    return logits, completion_ids, completion_starts, completion_lengths
 
 
 def build_student_prompt(question) -> List[Dict[str, Any]]:
