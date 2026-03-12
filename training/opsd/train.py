@@ -13,7 +13,7 @@ from accelerate import Accelerator
 from accelerate.utils import GradientAccumulationPlugin
 from data.livecodebench import format_question as get_question
 from training.common import ValidatorRunConfig
-from training.utils import get_world_size, get_grad_norm, get_logits_completion_ids_and_mask, build_student_messages, build_teacher_messages
+from training.utils import get_world_size, get_grad_norm, gather_completion_span, get_logits_completion_ids_and_mask, build_student_messages, build_teacher_messages
 from training.opsd.EMATeacher import EMATeacher
 from validators import Validator
 
@@ -166,7 +166,7 @@ def train(
                         max_new_tokens=hparams.max_response_length
                     )
                     feedbacks = [get_feedback_fn(
-                        rollout.completion, example) for rollout in rollouts]
+                        rollout["completion"], example) for rollout in rollouts]
 
                     batch_data.extend([{
                         "example": example,
@@ -174,23 +174,34 @@ def train(
                         "feedback": feedback
                     } for rollout, feedback in zip(rollouts, feedbacks)])
 
-                student_logits, _, student_masks = get_logits_completion_ids_and_mask(
+                student_logits, _, student_completion_starts, student_completion_lengths = get_logits_completion_ids_and_mask(
                     model,
                     tokenizer,
                     [build_student_messages(
-                        get_question(data["example"]), data["rollout"].completion) for data in batch_data],
+                        get_question(data["example"]), data["rollout"]["completion"]) for data in batch_data],
                     requires_grad=True
                 )
-                teacher_logits, _, _ = get_logits_completion_ids_and_mask(
+                student_logits = gather_completion_span(student_logits, student_completion_starts, student_completion_lengths)
+
+                teacher_logits, _, teacher_completion_starts, teacher_completion_lengths = get_logits_completion_ids_and_mask(
                     teacher,
                     tokenizer,
-                    [build_teacher_messages(get_question(data["example"]), data["rollout"].completion, data["feedback"].feedback_text,
-                                            data["rollout"].completion) for data in batch_data],
+                    [build_teacher_messages(get_question(data["example"]), data["rollout"]["completion"], data["feedback"].feedback_text,
+                                            data["rollout"]["completion"]) for data in batch_data],
                     requires_grad=False
+                )
+                teacher_logits = gather_completion_span(teacher_logits, teacher_completion_starts, teacher_completion_lengths)
+
+                mask = torch.zeros(student_logits.shape[0], student_logits.shape[1], device=student_logits.device, dtype=torch.bool)
+                relative_positions = torch.arange(
+                    student_logits.shape[1], device=student_logits.device
+                ).unsqueeze(0)
+                mask = relative_positions < student_completion_lengths.unsqueeze(1).clamp(
+                    max=student_logits.shape[1]
                 )
 
                 loss = compute_loss(student_logits, teacher_logits,
-                                    student_masks, hparams.top_k)
+                                    mask, hparams.top_k)
 
                 accelerator.backward(loss)
 
@@ -220,7 +231,7 @@ def train(
                             "train/loss": loss.item(),
                             "train/global_step": global_step,
                             "train/learning_rate": optimizer.param_groups[0]["lr"],
-                            "train/completion_tokens": student_masks.sum().item(),
+                            "train/completion_tokens": mask.sum().item(),
                         }
                         if grad_norm is not None:
                             log_dict["train/grad_norm"] = grad_norm
@@ -338,6 +349,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -361,8 +377,10 @@ if __name__ == "__main__":
         validation_interval=args.validation_interval,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
+    model.gradient_checkpointing_enable()
 
     dataset = LiveCodeBenchDataset()
     collate_fn = lcb_collate_fn

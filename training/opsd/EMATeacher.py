@@ -21,6 +21,10 @@ class EMATeacher:
         self.model.to(device)
         return self
 
+    @property
+    def device(self) -> torch.device:
+        return self.model.device
+
     @torch.no_grad()
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
