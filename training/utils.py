@@ -87,53 +87,35 @@ def get_completion_token_logprobs(
     sequence_lengths = full_encodings["attention_mask"].sum(dim=-1)
 
     if requires_grad:
-        outputs = model(**full_encodings)
+        outputs = model(**full_encodings, use_cache=False)
     else:
         with torch.no_grad():
-            outputs = model(**full_encodings)
+            outputs = model(**full_encodings, use_cache=False)
 
-    logits = outputs.logits.float()
+    logits = outputs.logits
     shifted_logits = logits[:, :-1, :]
     shifted_input_ids = full_encodings["input_ids"][:, 1:]
 
-    uniform_prompt_length = (
-        prompt_lengths.numel() > 0
-        and bool(torch.all(prompt_lengths == prompt_lengths[0]).item())
+    min_completion_start = int((prompt_lengths - 1).min().item())
+    max_completion_end = int((sequence_lengths - 1).max().item())
+    shifted_logits = shifted_logits[:, min_completion_start:max_completion_end, :]
+    shifted_input_ids = shifted_input_ids[:, min_completion_start:max_completion_end]
+
+    shifted_completion_logits = torch.gather(
+        shifted_logits, dim=-1, index=shifted_input_ids.unsqueeze(-1)
+    ).squeeze(-1)
+    token_logprobs = shifted_completion_logits - \
+        torch.logsumexp(shifted_logits, dim=-1)
+
+    relative_positions = torch.arange(
+        token_logprobs.shape[1], device=device
+    ).unsqueeze(0)
+    completion_starts = (prompt_lengths - 1 - min_completion_start).clamp(min=0)
+    completion_lengths = (sequence_lengths - prompt_lengths).clamp(min=0)
+    token_mask = (
+        (relative_positions >= completion_starts.unsqueeze(1))
+        & (relative_positions < (completion_starts + completion_lengths).unsqueeze(1))
     )
-
-    if uniform_prompt_length:
-        prompt_length = int(prompt_lengths[0].item())
-        completion_start = max(prompt_length - 1, 0)
-        shifted_logits = shifted_logits[:, completion_start:, :]
-        shifted_input_ids = shifted_input_ids[:, completion_start:]
-
-        shifted_completion_logits = torch.gather(
-            shifted_logits, dim=-1, index=shifted_input_ids.unsqueeze(-1)
-        ).squeeze(-1)
-        token_logprobs = shifted_completion_logits - \
-            torch.logsumexp(shifted_logits, dim=-1)
-
-        relative_positions = torch.arange(
-            token_logprobs.shape[1], device=device
-        ).unsqueeze(0)
-        completion_lengths = (sequence_lengths - prompt_lengths).clamp(min=0)
-        token_mask = relative_positions < completion_lengths.unsqueeze(1)
-    else:
-        shifted_completion_logits = torch.gather(
-            shifted_logits, dim=-1, index=shifted_input_ids.unsqueeze(-1)
-        ).squeeze(-1)
-        token_logprobs = shifted_completion_logits - \
-            torch.logsumexp(shifted_logits, dim=-1)
-
-        positions = torch.arange(
-            full_encodings["input_ids"].shape[-1], device=device
-        ).unsqueeze(0)
-        completion_mask = (
-            (positions >= prompt_lengths.unsqueeze(1))
-            & (positions < sequence_lengths.unsqueeze(1))
-        )
-        token_mask = completion_mask[:, 1:] & (
-            full_encodings["attention_mask"][:, 1:] > 0)
 
     return token_logprobs, token_mask
 
@@ -161,10 +143,10 @@ def get_logits_completion_ids_and_mask(
     sequence_lengths = attention_mask.sum(dim=-1)
 
     if requires_grad:
-        outputs = model(**full_encodings)
+        outputs = model(**full_encodings, use_cache=False)
     else:
         with torch.inference_mode():
-            outputs = model(**full_encodings)
+            outputs = model(**full_encodings, use_cache=False)
 
     logits = outputs.logits[:, :-1, :]
     completion_ids = input_ids[:, 1:].to(torch.int64)

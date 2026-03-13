@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from validators.validator import Validator
-from data.livecodebench import LiveCodeBenchDataset, extract_python_code, run_test_cases
+from data.livecodebench import LiveCodeBenchDataset, extract_python_code, run_test_cases, format_question as get_question
 
 
 class LiveCodeBenchValidator(Validator):
@@ -10,16 +10,19 @@ class LiveCodeBenchValidator(Validator):
 
         self.dataset = LiveCodeBenchDataset(subset_size=32)
 
-    def validate(
+    def compute_local_stats(
         self,
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
         batch_size: int,
         max_new_tokens: int = 2048,
         max_seq_length: int = 2048,
-        timeout_seconds: int = 10
-    ) -> float:
-        print(f"Validating LiveCodeBench...")
+        timeout_seconds: int = 10,
+        process_index: int = 0,
+        num_processes: int = 1,
+    ) -> dict[str, float]:
+        if process_index == 0:
+            print("Validating LiveCodeBench...")
 
         model.eval()
         gc_was_enabled = model.is_gradient_checkpointing
@@ -32,21 +35,22 @@ class LiveCodeBenchValidator(Validator):
             tokenizer.pad_token = tokenizer.eos_token
 
         correct = 0
-        total_questions = len(self.dataset)
-        total_batches = (total_questions // batch_size) if (total_questions %
-                                                            batch_size == 0) else (total_questions // batch_size) + 1
+        local_indices = list(range(process_index, len(self.dataset), num_processes))
+        total_batches = (len(local_indices) + batch_size - 1) // batch_size
 
-        for i in range(0, total_questions, batch_size):
-            print(f"Processing batch {i + 1} of {total_batches}...")
+        for batch_start in range(0, len(local_indices), batch_size):
+            if process_index == 0:
+                print(f"Processing batch {(batch_start // batch_size) + 1} of {total_batches}...")
 
-            batch_end = min(i + batch_size, total_questions)
-            batch_indices = range(i, batch_end)
+            batch_end = min(batch_start + batch_size, len(local_indices))
+            batch_indices = local_indices[batch_start:batch_end]
             batch_data = self.dataset.select(batch_indices)
 
             batch_prompts = []
             for example in batch_data:
                 prompt = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{example['question']}"}],
+                    [{"role": "user",
+                        "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block:\n\n{get_question(example)}"}],
                     add_generation_prompt=True,
                     tokenize=False
                 )
@@ -88,4 +92,11 @@ class LiveCodeBenchValidator(Validator):
 
         tokenizer.padding_side = original_padding_side
 
-        return correct / total_questions if total_questions > 0 else 0.0
+        return {
+            "correct": float(correct),
+            "total": float(len(local_indices)),
+        }
+
+    def compute_score(self, stats: dict[str, float]) -> float:
+        total = stats["total"]
+        return stats["correct"] / total if total > 0 else 0.0

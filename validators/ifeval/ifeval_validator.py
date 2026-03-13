@@ -3,7 +3,7 @@ import dataclasses
 import validators.ifeval.instructions_registry as instructions_registry
 from typing import Dict, Optional, Union
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from validators.validator import Validator
 
 
@@ -43,15 +43,18 @@ class IFEvalValidator(Validator):
 
         return all(is_following_list)
 
-    def validate(
+    def compute_local_stats(
         self,
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
         batch_size: int,
         max_new_tokens: int = 256,
         max_seq_length: int = 2048,
-    ) -> float:
-        print("Validating IFEval...")
+        process_index: int = 0,
+        num_processes: int = 1,
+    ) -> Dict[str, float]:
+        if process_index == 0:
+            print("Validating IFEval...")
 
         model.eval()
         # Disable gradient checkpointing for inference (massive speedup)
@@ -64,11 +67,11 @@ class IFEvalValidator(Validator):
         tokenizer.pad_token = tokenizer.eos_token
 
         correct = 0
-        total_examples = len(self.test_dataset)
+        local_indices = list(range(process_index, len(self.test_dataset), num_processes))
 
-        for i in range(0, total_examples, batch_size):
-            batch_end = min(i + batch_size, total_examples)
-            batch_indices = range(i, batch_end)
+        for i in range(0, len(local_indices), batch_size):
+            batch_end = min(i + batch_size, len(local_indices))
+            batch_indices = local_indices[i:batch_end]
             batch_data = self.test_dataset.select(batch_indices)
 
             batch_prompts = []
@@ -114,5 +117,11 @@ class IFEvalValidator(Validator):
             model.gradient_checkpointing_enable()
         model.train()
 
-        accuracy = correct / total_examples
-        return accuracy
+        return {
+            "correct": float(correct),
+            "total": float(len(local_indices)),
+        }
+
+    def compute_score(self, stats: Dict[str, float]) -> float:
+        total = stats["total"]
+        return stats["correct"] / total if total > 0 else 0.0

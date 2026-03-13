@@ -1,45 +1,28 @@
-import os
 import copy
 import logging
-import torch
-from datetime import datetime
 from dataclasses import dataclass
-from collections import defaultdict
-from typing import Dict, Any, List, Tuple, Callable
-from torch.utils.data import DataLoader
-from datasets import Dataset
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from accelerate import Accelerator
-from accelerate.utils import GradientAccumulationPlugin
+
 from data.livecodebench import format_question as get_question
-from training.common import ValidatorRunConfig
-from training.utils import get_world_size, get_grad_norm, build_student_messages, get_completion_token_logprobs
-from validators.validator import Validator
+from training.train import Hparams, ValidatorRunConfig, train as run_train
+from training.utils import build_student_messages, get_completion_token_logprobs
+
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class GRPOHparams:
-    learning_rate: float = 1e-6
-    weight_decay: float = 0.01
-    max_grad_norm: float = 1.0
-
-    num_epochs: int = 1
-    minibatch_size: int = 1
-    gradient_accumulation_steps: int = 32
+class GRPOHparams(Hparams):
     num_rollouts: int = 8
-
     max_prompt_length: int = 2048
     max_response_length: int = 8192
-
     temperature: float = 1.0
     clip_epsilon: float = 0.2
     kl_coef: float = 0.01
     advantage_epsilon: float = 1e-6
-
-    log_interval: int = 10
-    validation_interval: int = 10
 
 
 def compute_grpo_loss(
@@ -59,8 +42,7 @@ def compute_grpo_loss(
     unclipped = ratios * expanded_advantages
     clipped = torch.clamp(ratios, 1.0 - clip_epsilon,
                           1.0 + clip_epsilon) * expanded_advantages
-    policy_loss = -(torch.minimum(unclipped, clipped)
-                    * mask).sum() / token_count
+    policy_loss = -(torch.minimum(unclipped, clipped) * mask).sum() / token_count
 
     kl = ((new_token_logprobs - ref_token_logprobs) * mask).sum() / token_count
     loss = policy_loss + (kl_coef * kl)
@@ -78,331 +60,180 @@ def compute_grpo_loss(
     return loss, metrics
 
 
-def train(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    dataset: Dataset,
-    hparams: GRPOHparams,
-    collate_fn: Callable,
-    rollout_fn: Callable,
-    get_feedback_fn: Callable,
-    validators: List[Tuple[Validator, ValidatorRunConfig]],
-    output_dir: str = "outputs/grpo",
-    wandb_project: str = "kdpo-exploration",
-    wandb_run_name: str = "grpo",
-) -> Dict[str, Any]:
-    output_dir = f"{output_dir}/{wandb_run_name}/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    os.makedirs(output_dir, exist_ok=True)
-
-    world_size = get_world_size()
-    adjusted_gradient_accumulation_steps = max(
-        1, hparams.gradient_accumulation_steps // world_size)
-
-    gradient_accumulation_plugin = GradientAccumulationPlugin(
-        num_steps=adjusted_gradient_accumulation_steps,
-        adjust_scheduler=True,
-    )
-    accelerator = Accelerator(
-        gradient_accumulation_plugin=gradient_accumulation_plugin,
-        log_with="wandb" if wandb_project is not None else None,
-    )
-
-    if accelerator.is_main_process and wandb_project:
-        accelerator.init_trackers(
-            project_name=wandb_project,
-            config={
-                "learning_rate": hparams.learning_rate,
-                "num_epochs": hparams.num_epochs,
-                "minibatch_size": hparams.minibatch_size,
-                "gradient_accumulation_steps": adjusted_gradient_accumulation_steps,
-                "num_rollouts": hparams.num_rollouts,
-                "max_prompt_length": hparams.max_prompt_length,
-                "max_response_length": hparams.max_response_length,
-                "temperature": hparams.temperature,
-                "clip_epsilon": hparams.clip_epsilon,
-                "kl_coef": hparams.kl_coef,
-                "advantage_epsilon": hparams.advantage_epsilon,
-            },
-            init_kwargs={"wandb": {"name": wandb_run_name}
-                         } if wandb_run_name else None,
-        )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=hparams.minibatch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-    )
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=hparams.learning_rate,
-        weight_decay=hparams.weight_decay,
-    )
-
+def build_reference_model(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
     reference_model = copy.deepcopy(model)
     if hasattr(reference_model, "gradient_checkpointing_disable"):
         reference_model.gradient_checkpointing_disable()
     reference_model.requires_grad_(False)
     reference_model.eval()
+    return reference_model
 
-    model, optimizer, dataloader = accelerator.prepare(
-        model, optimizer, dataloader)
-    reference_model.to(accelerator.device)
+
+def forward(
+    accelerator,
+    model: AutoModelForCausalLM,
+    batch: List[Dict[str, Any]],
+    tokenizer: AutoTokenizer,
+    hparams: GRPOHparams,
+    reference_model: AutoModelForCausalLM,
+    rollout_fn: Callable,
+    get_feedback_fn: Callable,
+) -> Optional[Dict[str, Any]]:
+    batch_data: List[Dict[str, Any]] = []
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.eval()
+
+    for example in batch:
+        rollouts = rollout_fn(
+            unwrapped_model,
+            tokenizer,
+            example,
+            num_rollouts=hparams.num_rollouts,
+            temperature=hparams.temperature,
+            max_new_tokens=hparams.max_response_length,
+        )
+
+        rewards: List[float] = []
+        feedbacks = []
+        for rollout in rollouts:
+            feedback = get_feedback_fn(rollout["completion"], example)
+            feedbacks.append(feedback)
+            all_passed = bool(feedback.metadata.get(
+                "all_passed", feedback.success)) if feedback.metadata else bool(feedback.success)
+            rewards.append(1.0 if all_passed else 0.0)
+
+        reward_tensor = torch.tensor(
+            rewards,
+            dtype=torch.float32,
+            device=accelerator.device,
+        )
+        reward_mean = reward_tensor.mean()
+        reward_std = reward_tensor.std(unbiased=False)
+        advantages = (reward_tensor - reward_mean) / (
+            reward_std + hparams.advantage_epsilon
+        )
+
+        for rollout, feedback, reward, advantage in zip(
+            rollouts, feedbacks, rewards, advantages.tolist()
+        ):
+            batch_data.append(
+                {
+                    "question": get_question(example),
+                    "completion": rollout["completion"],
+                    "feedback": feedback.feedback_text,
+                    "reward": float(reward),
+                    "advantage": float(advantage),
+                }
+            )
+
+    if not batch_data:
+        return None
+
+    messages = [
+        build_student_messages(data["question"], data["completion"])
+        for data in batch_data
+    ]
+    max_seq_length = hparams.max_prompt_length + hparams.max_response_length
+
     model.train()
+    new_token_logprobs, token_mask = get_completion_token_logprobs(
+        model,
+        tokenizer,
+        messages,
+        max_seq_length=max_seq_length,
+        requires_grad=True,
+    )
+    old_token_logprobs = new_token_logprobs.detach()
+    ref_token_logprobs, _ = get_completion_token_logprobs(
+        reference_model,
+        tokenizer,
+        messages,
+        max_seq_length=max_seq_length,
+        requires_grad=False,
+    )
 
-    global_step = 0
-    validation_history = defaultdict(list)
-
-    if accelerator.is_main_process:
-        logger.info("Beginning training...")
-        logger.info(f"World size: {world_size}")
-        logger.info(f"Learning rate: {hparams.learning_rate}")
-        logger.info(f"Number of training steps: {len(dataloader)}")
-        logger.info(f"Number of validation steps: {len(validators)}")
-        logger.info(f"Number of epochs: {hparams.num_epochs}")
-        logger.info(
-            f"Gradient accumulation steps: {adjusted_gradient_accumulation_steps}")
-        logger.info(f"Number of rollouts: {hparams.num_rollouts}")
-        logger.info(f"Max prompt length: {hparams.max_prompt_length}")
-        logger.info(f"Max response length: {hparams.max_response_length}")
-        logger.info(f"Temperature: {hparams.temperature}")
-        logger.info(f"Clip epsilon: {hparams.clip_epsilon}")
-        logger.info(f"KL coefficient: {hparams.kl_coef}")
-
-    for epoch in range(hparams.num_epochs):
-        if accelerator.is_main_process:
-            logger.info(f"Epoch {epoch + 1}/{hparams.num_epochs}")
-
-        for batch_idx, batch in enumerate(dataloader):
-            logger.info(
-                f"Processing batch {batch_idx + 1} of {len(dataloader)}...")
-
-            with accelerator.accumulate(model):
-                batch_data: List[Dict[str, Any]] = []
-                unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.eval()
-
-                # TODO: Make rollouts properly batched
-                for example in batch:
-                    rollouts = rollout_fn(
-                        unwrapped_model,
-                        tokenizer,
-                        example,
-                        num_rollouts=hparams.num_rollouts,
-                        temperature=hparams.temperature,
-                        max_new_tokens=hparams.max_response_length,
-                    )
-
-                    # TODO: Make get_feedback_fn properly batched
-                    rewards: List[float] = []
-                    feedbacks = []
-                    for rollout in rollouts:
-                        feedback = get_feedback_fn(
-                            rollout["completion"], example)
-                        feedbacks.append(feedback)
-                        all_passed = bool(feedback.metadata.get(
-                            "all_passed", feedback.success)) if feedback.metadata else bool(feedback.success)
-                        rewards.append(1.0 if all_passed else 0.0)
-
-                    reward_tensor = torch.tensor(
-                        rewards,
-                        dtype=torch.float32,
-                        device=accelerator.device,
-                    )
-                    reward_mean = reward_tensor.mean()
-                    reward_std = reward_tensor.std(unbiased=False)
-                    advantages = (reward_tensor - reward_mean) / \
-                        (reward_std + hparams.advantage_epsilon)
-
-                    for rollout, feedback, reward, advantage in zip(rollouts, feedbacks, rewards, advantages.tolist()):
-                        batch_data.append(
-                            {
-                                "question": get_question(example),
-                                "completion": rollout["completion"],
-                                "feedback": feedback.feedback_text,
-                                "reward": float(reward),
-                                "advantage": float(advantage),
-                            }
-                        )
-
-                if len(batch_data) == 0:
-                    continue
-
-                messages = [
-                    build_student_messages(
-                        data["question"], data["completion"])
-                    for data in batch_data
-                ]
-                max_seq_length = hparams.max_prompt_length + hparams.max_response_length
-
-                model.train()
-                new_token_logprobs, token_mask = get_completion_token_logprobs(
-                    model,
-                    tokenizer,
-                    messages,
-                    max_seq_length=max_seq_length,
-                    requires_grad=True,
-                )
-                old_token_logprobs = new_token_logprobs.detach()
-                ref_token_logprobs, _ = get_completion_token_logprobs(
-                    reference_model,
-                    tokenizer,
-                    messages,
-                    max_seq_length=max_seq_length,
-                    requires_grad=False,
-                )
-
-                advantages = torch.tensor(
-                    [data["advantage"] for data in batch_data],
-                    dtype=new_token_logprobs.dtype,
-                    device=new_token_logprobs.device,
-                )
-                rewards = torch.tensor(
-                    [data["reward"] for data in batch_data],
-                    dtype=new_token_logprobs.dtype,
-                    device=new_token_logprobs.device,
-                )
-
-                loss, metrics = compute_grpo_loss(
-                    new_token_logprobs=new_token_logprobs,
-                    old_token_logprobs=old_token_logprobs,
-                    ref_token_logprobs=ref_token_logprobs,
-                    token_mask=token_mask,
-                    advantages=advantages,
-                    clip_epsilon=hparams.clip_epsilon,
-                    kl_coef=hparams.kl_coef,
-                )
-
-                accelerator.backward(loss)
-
-                grad_norm = None
-                if accelerator.sync_gradients:
-                    if hparams.max_grad_norm > 0:
-                        grad_norm = accelerator.clip_grad_norm_(
-                            model.parameters(), hparams.max_grad_norm)
-                        if isinstance(grad_norm, torch.Tensor):
-                            grad_norm = grad_norm.item()
-                    else:
-                        grad_norm = get_grad_norm(model)
-
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                    global_step += 1
-
-                    if global_step % hparams.log_interval == 0 and accelerator.is_main_process:
-                        logger.info(
-                            f"Step {global_step} - Loss: {loss.item():.4f}")
-                        log_dict = {
-                            "train/loss": loss.item(),
-                            "train/policy_loss": metrics["policy_loss"],
-                            "train/kl": metrics["kl"],
-                            "train/clip_fraction": metrics["clip_fraction"],
-                            "train/ratio_mean": metrics["ratio_mean"],
-                            "train/reward_mean": rewards.mean().item(),
-                            "train/reward_std": rewards.std(unbiased=False).item(),
-                            "train/advantage_mean": advantages.mean().item(),
-                            "train/advantage_std": advantages.std(unbiased=False).item(),
-                            "train/completion_tokens": token_mask.sum().item(),
-                            "train/global_step": global_step,
-                            "train/learning_rate": optimizer.param_groups[0]["lr"],
-                        }
-                        if grad_norm is not None:
-                            log_dict["train/grad_norm"] = grad_norm
-                        accelerator.log(log_dict, step=global_step)
-
-                    if global_step % hparams.validation_interval == 0 and accelerator.is_main_process:
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        unwrapped_model.eval()
-                        original_padding_side = tokenizer.padding_side
-                        original_pad_token = tokenizer.pad_token
-                        original_pad_token_id = tokenizer.pad_token_id
-
-                        for validator, val_config in validators:
-                            logger.info(f"Validating with {validator.name}...")
-                            try:
-                                score = validator.validate(
-                                    model=unwrapped_model,
-                                    tokenizer=tokenizer,
-                                    batch_size=val_config.batch_size,
-                                    max_new_tokens=val_config.max_new_tokens,
-                                    max_seq_length=val_config.max_seq_length,
-                                )
-                                validation_history[validator.name].append(
-                                    {"step": global_step, "score": score}
-                                )
-                                accelerator.log(
-                                    {f"val/{validator.name}": score}, step=global_step)
-                                logger.info(
-                                    f"Validation score for {validator.name}: {score:.4f}")
-                            except Exception as e:
-                                logger.error(
-                                    f"Error validating with {validator.name}: {e}")
-                            finally:
-                                tokenizer.padding_side = original_padding_side
-                                tokenizer.pad_token = original_pad_token
-                                tokenizer.pad_token_id = original_pad_token_id
-
-                        model.train()
-
-                    accelerator.wait_for_everyone()
-
-    if accelerator.is_main_process:
-        logger.info("Running final validation...")
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.eval()
-        original_padding_side = tokenizer.padding_side
-        original_pad_token = tokenizer.pad_token
-        original_pad_token_id = tokenizer.pad_token_id
-
-        for validator, val_config in validators:
-            logger.info(f"Validating with {validator.name}...")
-            try:
-                score = validator.validate(
-                    model=unwrapped_model,
-                    tokenizer=tokenizer,
-                    batch_size=val_config.batch_size,
-                    max_new_tokens=val_config.max_new_tokens,
-                    max_seq_length=val_config.max_seq_length,
-                )
-                validation_history[validator.name].append(
-                    {"step": "final", "score": score})
-                logger.info(
-                    f"Final validation score for {validator.name}: {score:.4f}")
-            except Exception as e:
-                logger.error(f"Error validating with {validator.name}: {e}")
-            finally:
-                tokenizer.padding_side = original_padding_side
-                tokenizer.pad_token = original_pad_token
-                tokenizer.pad_token_id = original_pad_token_id
-
-        unwrapped_model.save_pretrained(output_dir)
-        tokenizer.save_pretrained(output_dir)
-        logger.info(f"Model and tokenizer saved to {output_dir}")
-        logger.info("Training complete!")
-
-        if wandb_project:
-            accelerator.end_training()
-
-    accelerator.wait_for_everyone()
+    advantages = torch.tensor(
+        [data["advantage"] for data in batch_data],
+        dtype=new_token_logprobs.dtype,
+        device=new_token_logprobs.device,
+    )
+    rewards = torch.tensor(
+        [data["reward"] for data in batch_data],
+        dtype=new_token_logprobs.dtype,
+        device=new_token_logprobs.device,
+    )
 
     return {
-        "validation_history": validation_history,
+        "new_token_logprobs": new_token_logprobs,
+        "old_token_logprobs": old_token_logprobs,
+        "ref_token_logprobs": ref_token_logprobs,
+        "token_mask": token_mask,
+        "advantages": advantages,
+        "rewards": rewards,
     }
+
+
+def make_forward_backward_fn(
+    rollout_fn: Callable,
+    get_feedback_fn: Callable,
+) -> Callable:
+    def forward_backward(
+        accelerator,
+        model: AutoModelForCausalLM,
+        batch: List[Dict[str, Any]],
+        tokenizer: AutoTokenizer,
+        hparams: GRPOHparams,
+        auxiliary_model: AutoModelForCausalLM,
+    ):
+        forward_outputs = forward(
+            accelerator,
+            model,
+            batch,
+            tokenizer,
+            hparams,
+            auxiliary_model,
+            rollout_fn,
+            get_feedback_fn,
+        )
+        if forward_outputs is None:
+            return None, {}
+
+        loss, metrics = compute_grpo_loss(
+            new_token_logprobs=forward_outputs["new_token_logprobs"],
+            old_token_logprobs=forward_outputs["old_token_logprobs"],
+            ref_token_logprobs=forward_outputs["ref_token_logprobs"],
+            token_mask=forward_outputs["token_mask"],
+            advantages=forward_outputs["advantages"],
+            clip_epsilon=hparams.clip_epsilon,
+            kl_coef=hparams.kl_coef,
+        )
+        metrics.update(
+            {
+                "reward_mean": forward_outputs["rewards"].mean().item(),
+                "reward_std": forward_outputs["rewards"].std(unbiased=False).item(),
+                "advantage_mean": forward_outputs["advantages"].mean().item(),
+                "advantage_std": forward_outputs["advantages"].std(unbiased=False).item(),
+                "completion_tokens": forward_outputs["token_mask"].sum().item(),
+            }
+        )
+        return loss, metrics
+
+    return forward_backward
 
 
 if __name__ == "__main__":
     import argparse
     import random
+
     import numpy as np
+
     from data.livecodebench import (
         LiveCodeBenchDataset,
         collate_fn as lcb_collate_fn,
-        rollout as lcb_rollout,
         get_environment_feedback as lcb_get_feedback,
+        rollout as lcb_rollout,
     )
-    from validators import LiveCodeBenchValidator, FineWebValidator
+    from validators import FineWebValidator, LiveCodeBenchValidator
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", type=str, required=True)
@@ -410,6 +241,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-epochs", type=int, default=1)
+    parser.add_argument("--max-steps-per-epoch", type=int, default=None)
     parser.add_argument("--minibatch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--num-rollouts", type=int, default=8)
@@ -443,6 +275,7 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
         num_epochs=args.num_epochs,
+        max_steps_per_epoch=args.max_steps_per_epoch,
         minibatch_size=args.minibatch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_rollouts=args.num_rollouts,
@@ -456,16 +289,18 @@ if __name__ == "__main__":
         validation_interval=args.validation_interval,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
     model.gradient_checkpointing_enable()
 
-    dataset = LiveCodeBenchDataset()
-    collate_fn = lcb_collate_fn
-    rollout_fn = lcb_rollout
-    get_feedback_fn = lcb_get_feedback
+    reference_model = build_reference_model(model)
+    forward_backward_fn = make_forward_backward_fn(
+        lcb_rollout,
+        lcb_get_feedback,
+    )
 
+    dataset = LiveCodeBenchDataset()
     validators = [
         (
             LiveCodeBenchValidator(),
@@ -485,15 +320,15 @@ if __name__ == "__main__":
         ),
     ]
 
-    train(
+    run_train(
         model=model,
         tokenizer=tokenizer,
         dataset=dataset,
         hparams=hparams,
-        collate_fn=collate_fn,
-        rollout_fn=rollout_fn,
-        get_feedback_fn=get_feedback_fn,
+        collate_fn=lcb_collate_fn,
+        forward_backward_fn=forward_backward_fn,
         validators=validators,
+        auxiliary_model=reference_model,
         output_dir=args.output_dir,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
