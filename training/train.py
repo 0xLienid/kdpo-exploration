@@ -162,6 +162,19 @@ def train(
         for key, value in hparams.__dict__.items():
             logger.info(f"{key}: {value}")
 
+
+    if accelerator.is_main_process:
+        logger.info(f"Running initial validation...")
+    validator_results = validate(accelerator, model, tokenizer, validators)
+    if accelerator.is_main_process:
+        for validator, score in validator_results.items():
+            validation_history[validator].append({
+                "step": global_step,
+                "score": score
+            })
+            accelerator.log(
+                {f"val/{validator}": score}, step=global_step)
+
     for epoch in range(hparams.num_epochs):
         for step, batch in enumerate(dataloader):
             if hparams.max_steps_per_epoch is not None and step >= hparams.max_steps_per_epoch:
@@ -213,7 +226,7 @@ def train(
 
                     accelerator.wait_for_everyone()
 
-                if performed_optimizer_step and accelerator.is_main_process and global_step % hparams.log_interval == 0:
+                if accelerator.is_main_process and (performed_optimizer_step and global_step % hparams.log_interval == 0):
                     logger.info(
                         f"Step {global_step} - Loss: {loss.item():.4f}")
 

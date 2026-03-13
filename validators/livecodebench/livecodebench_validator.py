@@ -1,3 +1,4 @@
+import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from validators.validator import Validator
@@ -80,6 +81,9 @@ class LiveCodeBenchValidator(Validator):
 
             for j, completion in enumerate(completions):
                 private_test_cases = batch_data[j]["private_test_cases"]
+                if isinstance(private_test_cases, str):
+                    private_test_cases = json.loads(private_test_cases)
+
                 code = extract_python_code(completion)
 
                 all_passed, _ = run_test_cases(

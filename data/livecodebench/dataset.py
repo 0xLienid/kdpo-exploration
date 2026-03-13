@@ -88,7 +88,9 @@ class LiveCodeBenchDataset:
         return len(self._dataset)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return self._dataset[idx]
+        example = self._dataset[idx]
+        example["private_test_cases"] = json.loads(example["private_test_cases"])
+        return example
 
     def select(self, indices: List[int]) -> Dataset:
         return self._dataset.select(indices)
