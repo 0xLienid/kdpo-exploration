@@ -27,6 +27,7 @@ class KDPOHparams:
     max_grad_norm: float = 1.0
 
     num_epochs: int = 1
+    max_steps_per_epoch: int = 40
     minibatch_size: int = 1
     gradient_accumulation_steps: int = 32
     num_rollouts: int = 4
@@ -273,8 +274,7 @@ def train(
         logger.info("Beginning training...")
         logger.info(f"World size: {world_size}")
         logger.info(f"Learning rate: {hparams.learning_rate}")
-        logger.info(f"Number of training steps: {len(dataloader)}")
-        logger.info(f"Number of validation steps: {len(validators)}")
+        logger.info(f"Number of training steps: {hparams.max_steps_per_epoch}")
         logger.info(f"Number of epochs: {hparams.num_epochs}")
         logger.info(
             f"Gradient accumulation steps: {adjusted_gradient_accumulation_steps}")
@@ -290,6 +290,9 @@ def train(
             logger.info(f"Epoch {epoch + 1}/{hparams.num_epochs}")
 
         for batch_idx, batch in enumerate(dataloader):
+            if global_step >= hparams.max_steps_per_epoch:
+                break
+
             logger.info(
                 f"Processing batch {batch_idx + 1} of {len(dataloader)}...")
 
@@ -529,6 +532,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-epochs", type=int, default=1)
+    parser.add_argument("--max-steps-per-epoch", type=int, default=40)
     parser.add_argument("--minibatch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--num-rollouts", type=int, default=4)
@@ -561,6 +565,7 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         max_grad_norm=args.max_grad_norm,
         num_epochs=args.num_epochs,
+        max_steps_per_epoch=args.max_steps_per_epoch,
         minibatch_size=args.minibatch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_rollouts=args.num_rollouts,

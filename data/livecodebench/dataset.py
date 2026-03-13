@@ -6,6 +6,10 @@ import base64
 from typing import List, Dict, Optional, Any
 from datasets import Dataset
 from huggingface_hub import hf_hub_download
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -47,7 +51,8 @@ class LiveCodeBenchDataset:
                     repo_id="livecodebench/code_generation_lite",
                     filename=file,
                     repo_type="dataset",
-                    local_dir=self.data_dir
+                    local_dir=self.data_dir,
+                    token=os.getenv("HF_TOKEN")
                 )
 
     def _load_dataset(self) -> Dataset:
