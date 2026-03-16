@@ -123,10 +123,10 @@ def compute_loss(
     student_topk_probs_y = student_topk_logprobs_y.exp()
     kl_y = (student_topk_probs_y * (student_topk_logprobs_y -
             teacher_topk_logprobs_y)).sum(dim=-1)
-    del student_topk_logits_y, teacher_topk_logits_y_at_topk_indices, student_topk_probs_y, teacher_topk_logprobs_y
+    del student_topk_logits_y, teacher_logits_y_at_topk_indices, student_topk_probs_y, teacher_topk_logprobs_y
 
     preference_scores = beta * (student_relative_logprobs + reference_relative_logprobs)
-    weight = student_relative_logprobs.detach()
+    weight = torch.sigmoid(student_relative_logprobs.detach())
     core_scores = -F.logsigmoid(preference_scores)
     y_hat_score = weight * kl_y_hat
     y_score = (1 - weight) * kl_y
