@@ -1,4 +1,3 @@
-import copy
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -10,6 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from data.livecodebench import format_question as get_question
 from training.train import Hparams, ValidatorRunConfig, train as run_train
 from training.utils import (
+    build_reference_model,
     build_student_messages,
     build_teacher_prompt,
     get_completion_token_logprobs,

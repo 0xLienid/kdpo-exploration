@@ -1,5 +1,6 @@
 import os
 import math
+import copy
 import torch
 import torch.nn.functional as F
 from typing import List, Dict, Any, Tuple
@@ -18,6 +19,15 @@ def get_grad_norm(model: torch.nn.Module) -> float:
         grad_norm = param.grad.detach().data.norm(2).item()
         total_sq_norm += grad_norm * grad_norm
     return math.sqrt(total_sq_norm)
+
+
+def build_reference_model(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
+    reference_model = copy.deepcopy(model)
+    if hasattr(reference_model, "gradient_checkpointing_disable"):
+        reference_model.gradient_checkpointing_disable()
+    reference_model.requires_grad_(False)
+    reference_model.eval()
+    return reference_model
 
 
 def gather_completion_span(

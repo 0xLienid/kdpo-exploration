@@ -1,4 +1,3 @@
-import copy
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -8,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data.livecodebench import format_question as get_question
 from training.train import Hparams, ValidatorRunConfig, train as run_train
-from training.utils import build_student_messages, get_completion_token_logprobs
+from training.utils import build_reference_model, build_student_messages, get_completion_token_logprobs
 
 
 logger = logging.getLogger(__name__)
@@ -58,15 +57,6 @@ def compute_grpo_loss(
         "ratio_mean": ((ratios * mask).sum() / token_count).item(),
     }
     return loss, metrics
-
-
-def build_reference_model(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
-    reference_model = copy.deepcopy(model)
-    if hasattr(reference_model, "gradient_checkpointing_disable"):
-        reference_model.gradient_checkpointing_disable()
-    reference_model.requires_grad_(False)
-    reference_model.eval()
-    return reference_model
 
 
 def forward(
