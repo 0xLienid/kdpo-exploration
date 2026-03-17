@@ -55,15 +55,6 @@ def compute_dpo_loss(
     return loss, metrics
 
 
-def build_reference_model(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
-    reference_model = copy.deepcopy(model)
-    if hasattr(reference_model, "gradient_checkpointing_disable"):
-        reference_model.gradient_checkpointing_disable()
-    reference_model.requires_grad_(False)
-    reference_model.eval()
-    return reference_model
-
-
 def teacher_rollout(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
