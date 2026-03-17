@@ -9,7 +9,7 @@ class LiveCodeBenchValidator(Validator):
     def __init__(self):
         super().__init__("livecodebench")
 
-        self.dataset = LiveCodeBenchDataset(subset_size=32)
+        self.dataset = LiveCodeBenchDataset(subset_size=64)
 
     def compute_local_stats(
         self,

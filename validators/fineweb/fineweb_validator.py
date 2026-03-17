@@ -20,7 +20,7 @@ class FineWebValidator(Validator):
         batch_size: int,
         max_new_tokens: int = 0,  # unused for perplexity, kept for interface consistency
         max_seq_length: int = 1024,
-        num_samples: int = 16,
+        num_samples: int = 128,
         process_index: int = 0,
         num_processes: int = 1,
     ) -> dict[str, float]:
