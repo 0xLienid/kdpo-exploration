@@ -281,7 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--validation-interval", type=int, default=10)
-    parser.add_argument("--output-dir", type=str, default="outputs/SDPO")
+    parser.add_argument("--output-dir", type=str, default="outputs/sdpo")
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
