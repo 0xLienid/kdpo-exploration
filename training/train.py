@@ -75,24 +75,29 @@ def validate(
     validator_results = {}
 
     for validator, val_config in validators:
-        if accelerator.is_main_process:
-            logger.info(f"Validating with {validator.name}...")
+        try:
+            if accelerator.is_main_process:
+                logger.info(f"Validating with {validator.name}...")
 
-        score = validator.validate(
-            model=unwrapped_model,
-            tokenizer=tokenizer,
-            batch_size=val_config.batch_size,
-            max_new_tokens=val_config.max_new_tokens,
-            max_seq_length=val_config.max_seq_length,
-            accelerator=accelerator,
-        )
-        validator_results[validator.name] = score
-        if accelerator.is_main_process:
-            logger.info(f"Validation score for {validator.name}: {score:.4f}")
-        tokenizer.padding_side = original_padding_side
-        tokenizer.pad_token = original_pad_token
-        tokenizer.pad_token_id = original_pad_token_id
-        unwrapped_model.train()
+            score = validator.validate(
+                model=unwrapped_model,
+                tokenizer=tokenizer,
+                batch_size=val_config.batch_size,
+                max_new_tokens=val_config.max_new_tokens,
+                max_seq_length=val_config.max_seq_length,
+                accelerator=accelerator,
+            )
+            validator_results[validator.name] = score
+            if accelerator.is_main_process:
+                logger.info(f"Validation score for {validator.name}: {score:.4f}")
+        except Exception as e:
+            logger.error(f"Error validating with {validator.name}: {e}")
+            validator_results[validator.name] = 0.0
+        finally:
+            tokenizer.padding_side = original_padding_side
+            tokenizer.pad_token = original_pad_token
+            tokenizer.pad_token_id = original_pad_token_id
+            unwrapped_model.train()
 
     return validator_results
 

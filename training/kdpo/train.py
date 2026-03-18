@@ -470,7 +470,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-epochs", type=int, default=1)
-    parser.add_argument("--max-steps-per-epoch", type=int, default=40)
+    parser.add_argument("--max-steps-per-epoch", type=int, default=None)
     parser.add_argument("--minibatch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--num-rollouts", type=int, default=4)
