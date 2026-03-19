@@ -104,9 +104,16 @@ def compute_loss(
         student_logits_y_hat, dim=-1)
     del student_logits_y, student_logits_y_hat
 
-    student_relative_logprobs = student_completion_logprobs_y_hat - student_completion_logprobs_y
-    reference_relative_logprobs = reference_completion_logprobs_y - reference_completion_logprobs_y_hat
-    del student_completion_logits_y, student_completion_logits_y_hat, reference_completion_logprobs_y, reference_completion_logprobs_y_hat
+    student_sequence_logprobs_y = (student_completion_logprobs_y * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
+    student_sequence_logprobs_y_hat = (student_completion_logprobs_y_hat * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
+    reference_sequence_logprobs_y = (reference_completion_logprobs_y * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
+    reference_sequence_logprobs_y_hat = (reference_completion_logprobs_y_hat * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
+    del student_completion_logprobs_y, student_completion_logprobs_y_hat, reference_completion_logprobs_y, reference_completion_logprobs_y_hat
+
+    student_relative_logprobs = student_sequence_logprobs_y_hat - student_sequence_logprobs_y
+    y_logratios = student_sequence_logprobs_y - reference_sequence_logprobs_y
+    y_hat_logratios = student_sequence_logprobs_y_hat - reference_sequence_logprobs_y_hat
+    del student_sequence_logprobs_y, student_sequence_logprobs_y_hat, reference_sequence_logprobs_y, reference_sequence_logprobs_y_hat
 
     student_topk_logprobs_y_hat = student_logits_y_hat_at_topk_indices - torch.logsumexp(
         student_logits_y_hat_at_topk_indices, dim=-1, keepdim=True)
@@ -125,15 +132,14 @@ def compute_loss(
             teacher_topk_logprobs_y)).sum(dim=-1)
     del student_topk_logits_y, teacher_logits_y_at_topk_indices, student_topk_probs_y, teacher_topk_logprobs_y
 
-    preference_scores = beta * (student_relative_logprobs + reference_relative_logprobs)
+    preference_scores = beta * (y_hat_logratios - y_logratios)
     weight = torch.sigmoid(student_relative_logprobs.detach())
     core_scores = -F.logsigmoid(preference_scores)
-    y_hat_score = weight * kl_y_hat
-    y_score = (1 - weight) * kl_y
-    token_loss = core_scores + y_hat_score + y_score
-    valid_mask = valid_mask.to(token_loss.dtype)
-
-    loss = (token_loss * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+    
+    kl_loss = weight.unsqueeze(1) * kl_y_hat + (1 - weight.unsqueeze(1)) * kl_y
+    kl_loss = (kl_loss * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
+    
+    loss = (core_scores + kl_loss).mean()
 
     metrics = {
         "core_scores": core_scores.mean().item(),

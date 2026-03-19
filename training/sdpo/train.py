@@ -197,10 +197,10 @@ def forward(
 
     policy_mask = policy_mask.to(policy_token_logprobs.dtype)
     reference_mask = reference_mask.to(reference_token_logprobs.dtype)
-    policy_sequence_logprobs = (policy_token_logprobs * policy_mask).sum(dim=-1)
+    policy_sequence_logprobs = (policy_token_logprobs * policy_mask).sum(dim=-1) / policy_mask.sum(dim=-1).clamp(min=1)
     reference_sequence_logprobs = (
         reference_token_logprobs * reference_mask
-    ).sum(dim=-1)
+    ).sum(dim=-1) / reference_mask.sum(dim=-1).clamp(min=1)
 
     pair_count = len(batch_data)
 
