@@ -237,6 +237,7 @@ def forward(
             max_new_tokens=hparams.max_response_length,
         )
         feedbacks = [get_feedback_fn(rollout["completion"], example) for rollout in rollouts]
+        student_reward_pct = sum(1.0 if feedback.success else 0.0 for feedback in feedbacks) / len(feedbacks)
 
         teacher_rollouts = teacher_rollout(
             unwrapped_model,
@@ -247,6 +248,8 @@ def forward(
             temperature=hparams.temperature,
             max_new_tokens=hparams.max_response_length,
         )
+        teacher_feedbacks = [get_feedback_fn(teacher_regen["completion"], example) for teacher_regen in teacher_rollouts]
+        teacher_reward_pct = sum(1.0 if feedback.success else 0.0 for feedback in teacher_feedbacks) / len(teacher_feedbacks)
 
         batch_data.extend(
             {
@@ -404,6 +407,8 @@ def forward(
         "reference_lengths_y": reference_lengths_y,
         "reference_lengths_y_hat": reference_lengths_y_hat,
         "completion_tokens": completion_tokens,
+        "student_reward_pct": student_reward_pct,
+        "teacher_reward_pct": teacher_reward_pct,
     }
 
 
@@ -451,6 +456,8 @@ def make_forward_backward_fn(
             beta=hparams.beta,
         )
         metrics["completion_tokens"] = forward_outputs["completion_tokens"]
+        metrics["student_reward_pct"] = forward_outputs["student_reward_pct"]
+        metrics["teacher_reward_pct"] = forward_outputs["teacher_reward_pct"]
         return loss, metrics
 
     return forward_backward
