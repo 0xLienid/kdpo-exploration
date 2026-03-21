@@ -1,6 +1,8 @@
 import logging
 import math
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -22,6 +24,22 @@ from training.utils import (
 logger = logging.getLogger(__name__)
 
 
+def compute_rollout_overlap(student_completion: str, teacher_completion: str) -> float:
+    student_tokens = re.findall(r"\S+", student_completion)
+    teacher_tokens = re.findall(r"\S+", teacher_completion)
+
+    if not student_tokens and not teacher_tokens:
+        return 1.0
+    if not student_tokens or not teacher_tokens:
+        return 0.0
+    return SequenceMatcher(
+        None,
+        student_tokens,
+        teacher_tokens,
+        autojunk=False,
+    ).ratio()
+
+
 @dataclass
 class KDPOHparams(Hparams):
     max_steps_per_epoch: Optional[int] = 40
@@ -30,45 +48,42 @@ class KDPOHparams(Hparams):
     max_response_length: int = 8192
     top_k: int = 20
     temperature: float = 1.0
-    beta: float = 0.5
+    alpha: float = 0.5
+    mode: str = "ops"
 
 
 def compute_loss(
     student_logits_y: torch.Tensor,
     student_logits_y_hat: torch.Tensor,
-    completion_ids_y: torch.Tensor,
+    completion_ids_y_hat: torch.Tensor,
     teacher_logits_y: torch.Tensor,
     teacher_logits_y_hat: torch.Tensor,
-    completion_ids_y_hat: torch.Tensor,
-    reference_completion_logprobs_y: torch.Tensor,
-    reference_completion_logprobs_y_hat: torch.Tensor,
     student_lengths_y: torch.Tensor,
     student_lengths_y_hat: torch.Tensor,
     teacher_lengths_y: torch.Tensor,
     teacher_lengths_y_hat: torch.Tensor,
-    reference_lengths_y: torch.Tensor,
-    reference_lengths_y_hat: torch.Tensor,
     k: int = 20,
-    beta: float = 0.5,
+    alpha: float = 0.5,
+    mode: str = "ops",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    if mode not in ["ops", "is"]:
+        raise ValueError(f"Invalid mode: {mode}")
+
     common_lengths = torch.stack(
         [
             student_lengths_y,
             student_lengths_y_hat,
             teacher_lengths_y,
             teacher_lengths_y_hat,
-            reference_lengths_y,
-            reference_lengths_y_hat,
         ],
         dim=0,
     ).amin(dim=0)
     max_common_length = int(common_lengths.max().item())
     if max_common_length == 0:
         return student_logits_y.sum() * 0.0, {
-            "core_scores": 0.0,
-            "weight": 0.0,
             "y_hat_kl": 0.0,
             "y_kl": 0.0,
+            "rho_mean": 0.0,
         }
 
     relative_positions = torch.arange(
@@ -78,42 +93,31 @@ def compute_loss(
     student_logits_y_hat = student_logits_y_hat[:, :max_common_length]
     teacher_logits_y = teacher_logits_y[:, :max_common_length]
     teacher_logits_y_hat = teacher_logits_y_hat[:, :max_common_length]
-    reference_completion_logprobs_y = reference_completion_logprobs_y[:, :max_common_length]
-    reference_completion_logprobs_y_hat = reference_completion_logprobs_y_hat[:, :max_common_length]
-    completion_ids_y = completion_ids_y[:, :max_common_length]
     completion_ids_y_hat = completion_ids_y_hat[:, :max_common_length]
 
-    student_topk_logits_y, student_topk_indices_y = torch.topk(
-        student_logits_y, k, dim=-1)
-    teacher_logits_y_at_topk_indices = torch.gather(
-        teacher_logits_y, dim=-1, index=student_topk_indices_y)
+    # Importance ratio on actual y' tokens
+    student_completion_logprobs_y_hat = (
+        torch.gather(student_logits_y_hat, dim=-1, index=completion_ids_y_hat.unsqueeze(-1)).squeeze(-1)
+        - torch.logsumexp(student_logits_y_hat, dim=-1)
+    )
+    teacher_completion_logprobs_y_hat = (
+        torch.gather(teacher_logits_y_hat, dim=-1, index=completion_ids_y_hat.unsqueeze(-1)).squeeze(-1)
+        - torch.logsumexp(teacher_logits_y_hat, dim=-1)
+    )
+    log_rho = student_completion_logprobs_y_hat - teacher_completion_logprobs_y_hat
 
+    if mode == "ops":
+        rho = torch.exp(log_rho).clamp(max=1.0)
+    elif mode == "is":
+        rho = torch.exp(-log_rho).clamp(min=1.0)
+
+    del student_completion_logprobs_y_hat, teacher_completion_logprobs_y_hat, log_rho
+
+    # Top-k KL on y' (teacher's top-k)
     teacher_topk_logits_y_hat, teacher_topk_indices_y_hat = torch.topk(
         teacher_logits_y_hat, k, dim=-1)
     student_logits_y_hat_at_topk_indices = torch.gather(
         student_logits_y_hat, dim=-1, index=teacher_topk_indices_y_hat)
-
-    student_completion_logits_y = torch.gather(
-        student_logits_y, dim=-1, index=completion_ids_y.unsqueeze(-1)).squeeze(-1)
-    student_completion_logits_y_hat = torch.gather(
-        student_logits_y_hat, dim=-1, index=completion_ids_y_hat.unsqueeze(-1)).squeeze(-1)
-
-    student_completion_logprobs_y = student_completion_logits_y - torch.logsumexp(
-        student_logits_y, dim=-1)
-    student_completion_logprobs_y_hat = student_completion_logits_y_hat - torch.logsumexp(
-        student_logits_y_hat, dim=-1)
-    del student_logits_y, student_logits_y_hat
-
-    student_sequence_logprobs_y = (student_completion_logprobs_y * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
-    student_sequence_logprobs_y_hat = (student_completion_logprobs_y_hat * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
-    reference_sequence_logprobs_y = (reference_completion_logprobs_y * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
-    reference_sequence_logprobs_y_hat = (reference_completion_logprobs_y_hat * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
-    del student_completion_logprobs_y, student_completion_logprobs_y_hat, reference_completion_logprobs_y, reference_completion_logprobs_y_hat
-
-    student_relative_logprobs = student_sequence_logprobs_y_hat - student_sequence_logprobs_y
-    y_logratios = student_sequence_logprobs_y - reference_sequence_logprobs_y
-    y_hat_logratios = student_sequence_logprobs_y_hat - reference_sequence_logprobs_y_hat
-    del student_sequence_logprobs_y, student_sequence_logprobs_y_hat, reference_sequence_logprobs_y, reference_sequence_logprobs_y_hat
 
     student_topk_logprobs_y_hat = student_logits_y_hat_at_topk_indices - torch.logsumexp(
         student_logits_y_hat_at_topk_indices, dim=-1, keepdim=True)
@@ -121,7 +125,13 @@ def compute_loss(
         teacher_topk_logits_y_hat, dim=-1, keepdim=True)
     student_topk_probs_y_hat = student_topk_logprobs_y_hat.exp()
     kl_y_hat = (student_topk_probs_y_hat * (student_topk_logprobs_y_hat - teacher_topk_logprobs_y_hat)).sum(dim=-1)
-    del student_logits_y_hat_at_topk_indices, teacher_topk_logits_y_hat, student_topk_logprobs_y_hat, teacher_topk_logprobs_y_hat, student_topk_probs_y_hat
+    del student_logits_y_hat, student_logits_y_hat_at_topk_indices, teacher_topk_logits_y_hat, student_topk_logprobs_y_hat, teacher_topk_logprobs_y_hat, student_topk_probs_y_hat
+
+    # Top-k KL on y (student's top-k)
+    student_topk_logits_y, student_topk_indices_y = torch.topk(
+        student_logits_y, k, dim=-1)
+    teacher_logits_y_at_topk_indices = torch.gather(
+        teacher_logits_y, dim=-1, index=student_topk_indices_y)
 
     student_topk_logprobs_y = student_topk_logits_y - torch.logsumexp(
         student_topk_logits_y, dim=-1, keepdim=True)
@@ -130,22 +140,16 @@ def compute_loss(
     student_topk_probs_y = student_topk_logprobs_y.exp()
     kl_y = (student_topk_probs_y * (student_topk_logprobs_y -
             teacher_topk_logprobs_y)).sum(dim=-1)
-    del student_topk_logits_y, teacher_logits_y_at_topk_indices, student_topk_probs_y, teacher_topk_logprobs_y
+    del student_logits_y, student_topk_logits_y, teacher_logits_y_at_topk_indices, student_topk_probs_y, teacher_topk_logprobs_y
 
-    preference_scores = beta * (y_hat_logratios - y_logratios)
-    weight = torch.sigmoid(student_relative_logprobs.detach())
-    core_scores = -F.logsigmoid(preference_scores)
-    
-    kl_loss = weight.unsqueeze(1) * kl_y_hat + (1 - weight.unsqueeze(1)) * kl_y
-    kl_loss = (kl_loss * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
-    
-    loss = (core_scores + kl_loss).mean()
+    kl_loss_y = (kl_y * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
+    kl_loss_y_hat = (rho.detach() * kl_y_hat * valid_mask).sum(dim=1) / common_lengths.clamp(min=1)
+    loss = (kl_loss_y + alpha * kl_loss_y_hat).mean()
 
     metrics = {
-        "core_scores": core_scores.mean().item(),
-        "weight": weight.mean().item(),
         "y_hat_kl": kl_y_hat.mean().item(),
         "y_kl": kl_y.mean().item(),
+        "rho_mean": rho.mean().item(),
     }
     return loss, metrics
 
@@ -224,6 +228,7 @@ def forward(
     get_feedback_fn: Callable,
 ) -> Optional[Dict[str, Any]]:
     batch_data = []
+    overlap_scores = []
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.eval()
 
@@ -250,6 +255,12 @@ def forward(
         )
         teacher_feedbacks = [get_feedback_fn(teacher_regen["completion"], example) for teacher_regen in teacher_rollouts]
         teacher_reward_pct = sum(1.0 if feedback.success else 0.0 for feedback in teacher_feedbacks) / len(teacher_feedbacks)
+        overlap_scores.append(
+            sum(
+                compute_rollout_overlap(rollout["completion"], teacher_regen["completion"])
+                for rollout, teacher_regen in zip(rollouts, teacher_rollouts)
+            ) / len(rollouts)
+        )
 
         batch_data.extend(
             {
@@ -297,11 +308,6 @@ def forward(
         student_starts[len(batch_data):],
         student_lengths[len(batch_data):],
     )
-    completion_ids_y = gather_completion_span(
-        completion_ids[:len(batch_data)],
-        student_starts[:len(batch_data)],
-        student_lengths[:len(batch_data)],
-    )
     completion_ids_y_hat = gather_completion_span(
         completion_ids[len(batch_data):],
         student_starts[len(batch_data):],
@@ -310,36 +316,6 @@ def forward(
     student_lengths_y = student_lengths[:len(batch_data)]
     student_lengths_y_hat = student_lengths[len(batch_data):]
     del student_logits, completion_ids, student_starts, student_lengths
-
-    reference_logits, _, reference_starts, reference_lengths = get_logits_completion_ids_and_mask(
-        auxiliary_model,
-        tokenizer,
-        student_messages,
-        requires_grad=False,
-    )
-    reference_logits_y = gather_completion_span(
-        reference_logits[:len(batch_data)],
-        reference_starts[:len(batch_data)],
-        reference_lengths[:len(batch_data)],
-    )
-    reference_logits_y_hat = gather_completion_span(
-        reference_logits[len(batch_data):],
-        reference_starts[len(batch_data):],
-        reference_lengths[len(batch_data):],
-    )
-    reference_lengths_y = reference_lengths[:len(batch_data)]
-    reference_lengths_y_hat = reference_lengths[len(batch_data):]
-
-    reference_completion_logits_y = torch.gather(
-        reference_logits_y, dim=-1, index=completion_ids_y.unsqueeze(-1)).squeeze(-1)
-    reference_completion_logits_y_hat = torch.gather(
-        reference_logits_y_hat, dim=-1, index=completion_ids_y_hat.unsqueeze(-1)).squeeze(-1)
-
-    reference_completion_logprobs_y = reference_completion_logits_y - torch.logsumexp(
-        reference_logits_y, dim=-1)
-    reference_completion_logprobs_y_hat = reference_completion_logits_y_hat - torch.logsumexp(
-        reference_logits_y_hat, dim=-1)
-    del reference_logits, reference_logits_y, reference_logits_y_hat, reference_starts, reference_lengths, reference_completion_logits_y, reference_completion_logits_y_hat
 
     teacher_messages = [
         build_teacher_messages(
@@ -385,30 +361,25 @@ def forward(
             student_lengths_y_hat,
             teacher_lengths_y,
             teacher_lengths_y_hat,
-            reference_lengths_y,
-            reference_lengths_y_hat,
         ],
         dim=0,
     ).amin(dim=0).sum().item()
+    student_teacher_rollout_overlap = sum(overlap_scores) / len(overlap_scores)
 
     return {
         "student_logits_y": student_logits_y,
         "student_logits_y_hat": student_logits_y_hat,
-        "completion_ids_y": completion_ids_y,
-        "teacher_logits_y": teacher_logits_y,
-        "reference_completion_logprobs_y": reference_completion_logprobs_y,
-        "reference_completion_logprobs_y_hat": reference_completion_logprobs_y_hat,
-        "teacher_logits_y_hat": teacher_logits_y_hat,
         "completion_ids_y_hat": completion_ids_y_hat,
+        "teacher_logits_y": teacher_logits_y,
+        "teacher_logits_y_hat": teacher_logits_y_hat,
         "student_lengths_y": student_lengths_y,
         "student_lengths_y_hat": student_lengths_y_hat,
         "teacher_lengths_y": teacher_lengths_y,
         "teacher_lengths_y_hat": teacher_lengths_y_hat,
-        "reference_lengths_y": reference_lengths_y,
-        "reference_lengths_y_hat": reference_lengths_y_hat,
         "completion_tokens": completion_tokens,
         "student_reward_pct": student_reward_pct,
         "teacher_reward_pct": teacher_reward_pct,
+        "student_teacher_rollout_overlap": student_teacher_rollout_overlap,
     }
 
 
@@ -440,24 +411,21 @@ def make_forward_backward_fn(
         loss, metrics = compute_loss(
             student_logits_y=forward_outputs["student_logits_y"],
             student_logits_y_hat=forward_outputs["student_logits_y_hat"],
-            completion_ids_y=forward_outputs["completion_ids_y"],
+            completion_ids_y_hat=forward_outputs["completion_ids_y_hat"],
             teacher_logits_y=forward_outputs["teacher_logits_y"],
             teacher_logits_y_hat=forward_outputs["teacher_logits_y_hat"],
-            reference_completion_logprobs_y=forward_outputs["reference_completion_logprobs_y"],
-            reference_completion_logprobs_y_hat=forward_outputs["reference_completion_logprobs_y_hat"],
-            completion_ids_y_hat=forward_outputs["completion_ids_y_hat"],
             student_lengths_y=forward_outputs["student_lengths_y"],
             student_lengths_y_hat=forward_outputs["student_lengths_y_hat"],
             teacher_lengths_y=forward_outputs["teacher_lengths_y"],
             teacher_lengths_y_hat=forward_outputs["teacher_lengths_y_hat"],
-            reference_lengths_y=forward_outputs["reference_lengths_y"],
-            reference_lengths_y_hat=forward_outputs["reference_lengths_y_hat"],
             k=hparams.top_k,
-            beta=hparams.beta,
+            alpha=hparams.alpha,
+            mode=hparams.mode,
         )
         metrics["completion_tokens"] = forward_outputs["completion_tokens"]
         metrics["student_reward_pct"] = forward_outputs["student_reward_pct"]
         metrics["teacher_reward_pct"] = forward_outputs["teacher_reward_pct"]
+        metrics["student_teacher_rollout_overlap"] = forward_outputs["student_teacher_rollout_overlap"]
         return loss, metrics
 
     return forward_backward
@@ -491,7 +459,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-response-length", type=int, default=8192)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=0.5)
+    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--mode", type=str, default="ops")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="outputs/kdpo")
@@ -524,7 +493,8 @@ if __name__ == "__main__":
         max_response_length=args.max_response_length,
         top_k=args.top_k,
         temperature=args.temperature,
-        beta=args.beta,
+        alpha=args.alpha,
+        mode=args.mode,
         log_interval=args.log_interval,
         validation_interval=args.validation_interval,
     )
