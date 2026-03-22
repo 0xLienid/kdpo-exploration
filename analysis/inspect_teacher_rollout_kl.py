@@ -201,9 +201,9 @@ def compute_teacher_rollout_metrics(
 
     student_logprobs_on_teacher_topk = student_logits_at_teacher_topk - student_log_z
     teacher_logprobs_on_teacher_topk = teacher_topk_logits - teacher_log_z
-    average_student_probs_on_teacher_topk = student_logprobs_on_teacher_topk.exp().mean(dim=-1)
-    average_student_logprobs_on_teacher_topk = student_logprobs_on_teacher_topk.mean(dim=-1)
-    average_teacher_logprobs_on_teacher_topk = teacher_logprobs_on_teacher_topk.mean(dim=-1)
+    average_student_probs_on_teacher_topk = student_logprobs_on_teacher_topk.exp()
+    average_student_logprobs_on_teacher_topk = student_logprobs_on_teacher_topk
+    average_teacher_logprobs_on_teacher_topk = teacher_logprobs_on_teacher_topk
 
     full_reverse_kl = compute_full_reverse_kl(
         student_logits=student_logits,
@@ -252,7 +252,13 @@ def build_ventile_summary(
             )
         else:
             for key, values in metrics.items():
-                summary[key] = values[start:end].mean().item()
+                window_values = values[start:end]
+                window_mean = window_values.mean(dim=0)
+
+                if window_mean.ndim == 0:
+                    summary[key] = window_mean.item()
+                else:
+                    summary[key] = window_mean.tolist()
 
         summaries.append(summary)
 
@@ -261,12 +267,12 @@ def build_ventile_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3.5-2B")
     parser.add_argument("--example-index", type=int, default=0)
     parser.add_argument("--student-temperature", type=float, default=1.0)
     parser.add_argument("--teacher-temperature", type=float, default=1.0)
-    parser.add_argument("--student-max-new-tokens", type=int, default=2048)
-    parser.add_argument("--teacher-max-new-tokens", type=int, default=2048)
+    parser.add_argument("--student-max-new-tokens", type=int, default=8192)
+    parser.add_argument("--teacher-max-new-tokens", type=int, default=8192)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--vocab-chunk-size", type=int, default=4096)
     parser.add_argument("--device", type=str, default="auto")
@@ -388,7 +394,9 @@ def main() -> None:
         },
     }
 
-    print(json.dumps(output, indent=2))
+    with open(f"output_{args.model_name.replace('/', '_')}_{args.example_index}.json", "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"Output saved to output_{args.model_name.replace('/', '_')}_{args.example_index}.json")
 
 
 if __name__ == "__main__":
