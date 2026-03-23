@@ -18,6 +18,7 @@ data_raw/
 
 # Outputs
 outputs/
+results/
 
 # Logging
 wandb/
