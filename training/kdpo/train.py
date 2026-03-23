@@ -105,7 +105,7 @@ def compute_loss(
 
     kl_loss_y = (kl_y * opsd_mask).sum(dim=1) / opsd_lengths.clamp(min=1)
 
-    # --- Reward: R = teacher_logprob(y')/|y'| - teacher_logprob(y)/|y| ---
+    # --- Sequence logprobs for reward and preference ---
     y_lengths = opsd_lengths
     y_hat_lengths = torch.stack([student_lengths_y_hat, teacher_lengths_y_hat], dim=0).amin(dim=0)
     max_y = max_opsd
@@ -113,12 +113,16 @@ def compute_loss(
 
     teacher_seq_logprob_y = _seq_logprobs(teacher_logits_y, completion_ids_y, y_lengths, max_y)
     teacher_seq_logprob_y_hat = _seq_logprobs(teacher_logits_y_hat, completion_ids_y_hat, y_hat_lengths, max_y_hat)
-    R = (teacher_seq_logprob_y_hat - teacher_seq_logprob_y).detach()
-
-    # --- Preference: -R · (log π_s(y')/|y'| - log π_s(y)/|y|) ---
     student_seq_logprob_y = _seq_logprobs(student_logits_y, completion_ids_y, y_lengths, max_y)
     student_seq_logprob_y_hat = _seq_logprobs(student_logits_y_hat, completion_ids_y_hat, y_hat_lengths, max_y_hat)
-    pref_loss = -R * (student_seq_logprob_y_hat - student_seq_logprob_y)
+
+    # R = value of feedback: how much does the feedback context boost y' relative to y?
+    # feedback_boost_y_hat = teacher_seq_logprob_y_hat - student_seq_logprob_y_hat
+    # feedback_boost_y = teacher_seq_logprob_y - student_seq_logprob_y
+    # R = (feedback_boost_y_hat - feedback_boost_y).detach().clamp(min=0.0)
+
+    # --- Preference: -R · (log π_s(y')/|y'| - log π_s(y)/|y|) ---
+    pref_loss = -(student_seq_logprob_y_hat - student_seq_logprob_y)
 
     loss = (kl_loss_y + alpha * pref_loss).mean()
 
@@ -126,6 +130,8 @@ def compute_loss(
         "y_kl": kl_y.mean().item(),
         "reward": R.mean().item(),
         "pref_loss": pref_loss.mean().item(),
+        "feedback_boost_y_hat": feedback_boost_y_hat.mean().item(),
+        "feedback_boost_y": feedback_boost_y.mean().item(),
     }
     return loss, metrics
 
