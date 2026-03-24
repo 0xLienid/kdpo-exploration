@@ -116,22 +116,14 @@ def compute_loss(
     student_seq_logprob_y = _seq_logprobs(student_logits_y, completion_ids_y, y_lengths, max_y)
     student_seq_logprob_y_hat = _seq_logprobs(student_logits_y_hat, completion_ids_y_hat, y_hat_lengths, max_y_hat)
 
-    # R = value of feedback: how much does the feedback context boost y' relative to y?
-    # feedback_boost_y_hat = teacher_seq_logprob_y_hat - student_seq_logprob_y_hat
-    # feedback_boost_y = teacher_seq_logprob_y - student_seq_logprob_y
-    # R = (feedback_boost_y_hat - feedback_boost_y).detach().clamp(min=0.0)
-
-    # --- Preference: -R · (log π_s(y')/|y'| - log π_s(y)/|y|) ---
+    # --- Preference: -(log π_s(y')/|y'| - log π_s(y)/|y|) ---
     pref_loss = -(student_seq_logprob_y_hat - student_seq_logprob_y)
 
     loss = (kl_loss_y + alpha * pref_loss).mean()
 
     metrics = {
         "y_kl": kl_y.mean().item(),
-        "reward": R.mean().item(),
         "pref_loss": pref_loss.mean().item(),
-        "feedback_boost_y_hat": feedback_boost_y_hat.mean().item(),
-        "feedback_boost_y": feedback_boost_y.mean().item(),
     }
     return loss, metrics
 
