@@ -69,7 +69,6 @@ def compute_loss(
     completion_ids_y: torch.Tensor,
     completion_ids_y_hat: torch.Tensor,
     teacher_logits_y: torch.Tensor,
-    teacher_logits_y_hat: torch.Tensor,
     student_lengths_y: torch.Tensor,
     student_lengths_y_hat: torch.Tensor,
     teacher_lengths_y: torch.Tensor,
@@ -111,8 +110,6 @@ def compute_loss(
     max_y = max_opsd
     max_y_hat = int(y_hat_lengths.max().item())
 
-    teacher_seq_logprob_y = _seq_logprobs(teacher_logits_y, completion_ids_y, y_lengths, max_y)
-    teacher_seq_logprob_y_hat = _seq_logprobs(teacher_logits_y_hat, completion_ids_y_hat, y_hat_lengths, max_y_hat)
     student_seq_logprob_y = _seq_logprobs(student_logits_y, completion_ids_y, y_lengths, max_y)
     student_seq_logprob_y_hat = _seq_logprobs(student_logits_y_hat, completion_ids_y_hat, y_hat_lengths, max_y_hat)
 
@@ -325,11 +322,6 @@ def forward(
         teacher_starts[:len(batch_data)],
         teacher_lengths[:len(batch_data)],
     )
-    teacher_logits_y_hat = gather_completion_span(
-        teacher_logits[len(batch_data):],
-        teacher_starts[len(batch_data):],
-        teacher_lengths[len(batch_data):],
-    )
     teacher_lengths_y = teacher_lengths[:len(batch_data)]
     teacher_lengths_y_hat = teacher_lengths[len(batch_data):]
     del teacher_logits, teacher_starts, teacher_lengths
@@ -346,7 +338,6 @@ def forward(
         "completion_ids_y": completion_ids_y,
         "completion_ids_y_hat": completion_ids_y_hat,
         "teacher_logits_y": teacher_logits_y,
-        "teacher_logits_y_hat": teacher_logits_y_hat,
         "student_lengths_y": student_lengths_y,
         "student_lengths_y_hat": student_lengths_y_hat,
         "teacher_lengths_y": teacher_lengths_y,
@@ -389,7 +380,6 @@ def make_forward_backward_fn(
             completion_ids_y=forward_outputs["completion_ids_y"],
             completion_ids_y_hat=forward_outputs["completion_ids_y_hat"],
             teacher_logits_y=forward_outputs["teacher_logits_y"],
-            teacher_logits_y_hat=forward_outputs["teacher_logits_y_hat"],
             student_lengths_y=forward_outputs["student_lengths_y"],
             student_lengths_y_hat=forward_outputs["student_lengths_y_hat"],
             teacher_lengths_y=forward_outputs["teacher_lengths_y"],
@@ -477,7 +467,6 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model.gradient_checkpointing_enable()
 
-    reference_model = build_reference_model(model)
     forward_backward_fn = make_forward_backward_fn(
         lcb_rollout,
         lcb_get_feedback,
@@ -510,7 +499,6 @@ if __name__ == "__main__":
         hparams=hparams,
         collate_fn=lcb_collate_fn,
         forward_backward_fn=forward_backward_fn,
-        auxiliary_model=reference_model,
         validators=validators,
         output_dir=args.output_dir,
         wandb_project=args.wandb_project,
