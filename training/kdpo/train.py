@@ -12,7 +12,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from data.livecodebench import format_question as get_question
 from training.train import Hparams, ValidatorRunConfig, train as run_train
 from training.utils import (
-    build_reference_model,
     build_student_messages,
     build_teacher_messages,
     build_teacher_prompt,
@@ -72,7 +71,6 @@ def compute_loss(
     student_lengths_y: torch.Tensor,
     student_lengths_y_hat: torch.Tensor,
     teacher_lengths_y: torch.Tensor,
-    teacher_lengths_y_hat: torch.Tensor,
     k: int = 20,
     alpha: float = 0.5,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -106,7 +104,7 @@ def compute_loss(
 
     # --- Sequence logprobs for reward and preference ---
     y_lengths = opsd_lengths
-    y_hat_lengths = torch.stack([student_lengths_y_hat, teacher_lengths_y_hat], dim=0).amin(dim=0)
+    y_hat_lengths = student_lengths_y_hat
     max_y = max_opsd
     max_y_hat = int(y_hat_lengths.max().item())
 
@@ -301,14 +299,6 @@ def forward(
             data["rollout"]["completion"],
         )
         for data in batch_data
-    ] + [
-        build_teacher_messages(
-            get_question(data["example"]),
-            data["rollout"]["completion"],
-            data["feedback"].feedback_text,
-            data["teacher_rollout"]["completion"],
-        )
-        for data in batch_data
     ]
     teacher_logits, _, teacher_starts, teacher_lengths = get_logits_completion_ids_and_mask(
         model,
@@ -318,16 +308,15 @@ def forward(
     )
 
     teacher_logits_y = gather_completion_span(
-        teacher_logits[:len(batch_data)],
-        teacher_starts[:len(batch_data)],
-        teacher_lengths[:len(batch_data)],
+        teacher_logits,
+        teacher_starts,
+        teacher_lengths,
     )
-    teacher_lengths_y = teacher_lengths[:len(batch_data)]
-    teacher_lengths_y_hat = teacher_lengths[len(batch_data):]
+    teacher_lengths_y = teacher_lengths
     del teacher_logits, teacher_starts, teacher_lengths
 
     completion_tokens = torch.stack(
-        [student_lengths_y, student_lengths_y_hat, teacher_lengths_y, teacher_lengths_y_hat],
+        [student_lengths_y, student_lengths_y_hat, teacher_lengths_y],
         dim=0,
     ).amin(dim=0).sum().item()
     student_teacher_rollout_overlap = sum(overlap_scores) / len(overlap_scores)
@@ -341,7 +330,6 @@ def forward(
         "student_lengths_y": student_lengths_y,
         "student_lengths_y_hat": student_lengths_y_hat,
         "teacher_lengths_y": teacher_lengths_y,
-        "teacher_lengths_y_hat": teacher_lengths_y_hat,
         "completion_tokens": completion_tokens,
         "student_reward_pct": student_reward_pct,
         "teacher_reward_pct": teacher_reward_pct,
@@ -383,7 +371,6 @@ def make_forward_backward_fn(
             student_lengths_y=forward_outputs["student_lengths_y"],
             student_lengths_y_hat=forward_outputs["student_lengths_y_hat"],
             teacher_lengths_y=forward_outputs["teacher_lengths_y"],
-            teacher_lengths_y_hat=forward_outputs["teacher_lengths_y_hat"],
             k=hparams.top_k,
             alpha=hparams.alpha,
         )
