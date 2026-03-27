@@ -192,3 +192,15 @@ def build_teacher_messages(question: str, student_attempt: str, feedback: str, c
             "content": f"## Question\n{question}\n\n## Previous Attempt\n{student_attempt}\n\n## Feedback (from environment) for the previous attempt\n{feedback}\n\nCorrectly solve the original question."},
         {"role": "assistant", "content": completion}
     ]
+
+
+def build_insight_prompt(question: str, student_attempt: str, feedback: str) -> List[Dict[str, Any]]:
+    return [
+        {"role": "user", "content": f"You are a tutor reviewing a student's attempt at a problem alongside execution feedback from the environment. Your job is to help the student reason better without telling them the answer.\n\n## Question\n{question}\n\n## Student's Attempt\n{student_attempt}\n\n## Feedback (from environment) for the student's attempt\n{feedback}\n\nProduce insights in the following categories:\n- STRATEGY: What general approach or framework applies to this problem?\n- PITFALLS: What does the feedback reveal about common mistakes or the student's mistakes in problems like this?\n- DIAGNOSIS: What conceptual error likely produced the observed failure (if any)? Do not state the fix -- identify the flawed reasoning pattern.\n- STRENGTHS: What did the student do well that should be reinforced?\n\nDo not state the corrected code or solution. Your insights should help the student develop better reasoning habits, not solve this specific instance."}
+    ]
+
+def build_insight_teacher_messages(question: str, insight: str, completion: str) -> List[Dict[str, Any]]:
+    return [
+        {"role": "user", "content": f"Answer the following question, please keep your reasoning concise, and put your code in a ```python{{code}}``` block.\n\nHere are some insights about how to reason through this problem:\n{insight}\n\nQuestion:\n{question}"},
+        {"role": "assistant", "content": completion}
+    ]

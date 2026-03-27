@@ -30,6 +30,14 @@ class EMATeacher:
         return self.model(*args, **kwargs)
 
     @torch.no_grad()
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    @torch.no_grad()
+    def generate(self, *args, **kwargs):
+        return self.model.generate(*args, **kwargs)
+
+    @torch.no_grad()
     def update(self, model: AutoModelForCausalLM):
         student_params = dict(model.named_parameters())
 
