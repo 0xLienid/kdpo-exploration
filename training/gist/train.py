@@ -46,21 +46,21 @@ def compute_loss(
     k: int = 20,
     beta: float = 0.1,
 ) -> torch.Tensor:
-    seq_lengths = mask.sum(dim=-1).clamp(min=1.0)
     teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
     teacher_token_log_probs = teacher_log_probs.gather(dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)
 
     student_log_probs = F.log_softmax(student_logits, dim=-1)
     student_token_log_probs = student_log_probs.gather(dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)
 
-    rewards = ((teacher_token_log_probs - student_token_log_probs) * mask).sum(dim=-1) / seq_lengths
+    # PG: raw sums, no length normalization
+    rewards = ((teacher_token_log_probs - student_token_log_probs) * mask).sum(dim=-1)
     baseline = rewards.mean()
     advantages = rewards - baseline
 
-    student_seq_log_probs = (student_token_log_probs * mask).sum(dim=-1) / seq_lengths
+    student_seq_log_probs = (student_token_log_probs * mask).sum(dim=-1)
     pg_loss = -(advantages.detach() * student_seq_log_probs).mean()
 
-    # KL portion of loss
+    # KL: per-token normalized (no length bias by construction)
     student_topk_logits, student_topk_indices = torch.topk(
         student_logits, k, dim=-1)
     teacher_logits_at_topk_indices = torch.gather(
