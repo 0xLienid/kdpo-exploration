@@ -35,14 +35,32 @@ class GISTHparams(Hparams):
     top_k: int = 20
     temperature: float = 1.0
     teacher_alpha: float = 0.0
+    beta: float = 0.1
 
 
 def compute_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
+    completion_ids: torch.Tensor,
     mask: torch.Tensor,
     k: int = 20,
+    beta: float = 0.1,
 ) -> torch.Tensor:
+    seq_lengths = mask.sum(dim=-1).clamp(min=1.0)
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+    teacher_token_log_probs = teacher_log_probs.gather(dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)
+
+    rewards = (teacher_token_log_probs * mask).sum(dim=-1) / seq_lengths
+    baseline = rewards.mean()
+    advantages = rewards - baseline
+
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    student_token_log_probs = student_log_probs.gather(dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)
+    student_seq_log_probs = (student_token_log_probs * mask).sum(dim=-1) / seq_lengths
+
+    pg_loss = -(advantages.detach() * student_seq_log_probs).mean()
+
+    # KL portion of loss
     student_topk_logits, student_topk_indices = torch.topk(
         student_logits, k, dim=-1)
     teacher_logits_at_topk_indices = torch.gather(
@@ -52,7 +70,9 @@ def compute_loss(
     s_log_probs = F.log_softmax(student_topk_logits, dim=-1)
     t_log_probs = F.log_softmax(teacher_logits_at_topk_indices, dim=-1)
 
-    return ((s_probs * (s_log_probs - t_log_probs)).sum(dim=-1) * mask).sum() / mask.sum().clamp(min=1.0)
+    kl_loss = ((s_probs * (s_log_probs - t_log_probs)).sum(dim=-1) * mask).sum() / mask.sum().clamp(min=1.0)
+
+    return kl_loss + beta * pg_loss
 
 
 def insight_rollout(
@@ -163,7 +183,7 @@ def forward(
     student_messages = [build_student_messages(get_question(data["example"]), data["rollout"]["completion"]) for data in batch_data]
     teacher_messages = [build_insight_teacher_messages(get_question(data["example"]), data["teacher_insight"]["completion"], data["rollout"]["completion"]) for data in batch_data]
 
-    student_logits, _, student_starts, student_lengths = get_logits_completion_ids_and_mask(
+    student_logits, completion_ids, student_starts, student_lengths = get_logits_completion_ids_and_mask(
         model,
         tokenizer,
         student_messages,
@@ -171,6 +191,11 @@ def forward(
     )
     student_logits = gather_completion_span(
         student_logits,
+        student_starts,
+        student_lengths,
+    )
+    completion_ids = gather_completion_span(
+        completion_ids,
         student_starts,
         student_lengths,
     )
@@ -197,6 +222,7 @@ def forward(
     return {
         "student_logits": student_logits,
         "teacher_logits": teacher_logits,
+        "completion_ids": completion_ids,
         "mask": mask,
         "completion_tokens": mask.sum().item(),
     }
@@ -230,8 +256,10 @@ def make_forward_backward_fn(
         loss = compute_loss(
             student_logits=forward_outputs["student_logits"],
             teacher_logits=forward_outputs["teacher_logits"],
+            completion_ids=forward_outputs["completion_ids"],
             mask=forward_outputs["mask"],
             k=hparams.top_k,
+            beta=hparams.beta,
         )
         return loss, {"completion_tokens": forward_outputs["completion_tokens"]}
 
@@ -273,6 +301,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--teacher-alpha", type=float, default=0.0)
+    parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="outputs/gist")
@@ -306,6 +335,7 @@ if __name__ == "__main__":
         top_k=args.top_k,
         temperature=args.temperature,
         teacher_alpha=args.teacher_alpha,
+        beta=args.beta,
         log_interval=args.log_interval,
         validation_interval=args.validation_interval,
     )
@@ -334,7 +364,7 @@ if __name__ == "__main__":
         (
             FineWebValidator(),
             ValidatorRunConfig(
-                batch_size=16,
+                batch_size=8,
                 max_new_tokens=0,
                 max_seq_length=1024,
             ),

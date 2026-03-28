@@ -278,7 +278,7 @@ if __name__ == "__main__":
         (
             FineWebValidator(),
             ValidatorRunConfig(
-                batch_size=16,
+                batch_size=8,
                 max_new_tokens=0,
                 max_seq_length=1024,
             ),
