@@ -50,14 +50,14 @@ def compute_loss(
     teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
     teacher_token_log_probs = teacher_log_probs.gather(dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)
 
-    rewards = (teacher_token_log_probs * mask).sum(dim=-1) / seq_lengths
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    student_token_log_probs = student_log_probs.gather(dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)
+
+    rewards = ((teacher_token_log_probs - student_token_log_probs) * mask).sum(dim=-1) / seq_lengths
     baseline = rewards.mean()
     advantages = rewards - baseline
 
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    student_token_log_probs = student_log_probs.gather(dim=-1, index=completion_ids.unsqueeze(-1)).squeeze(-1)
     student_seq_log_probs = (student_token_log_probs * mask).sum(dim=-1) / seq_lengths
-
     pg_loss = -(advantages.detach() * student_seq_log_probs).mean()
 
     # KL portion of loss
