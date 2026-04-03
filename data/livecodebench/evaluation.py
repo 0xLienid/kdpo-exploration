@@ -5,6 +5,8 @@ import tempfile
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
 
+from data.feedback import FeedbackResult
+
 
 BASE_IMPORTS = (
     "from string import *\nfrom re import *\nfrom datetime import *\nfrom collections import *\n"
@@ -40,13 +42,6 @@ class TestCaseResult:
     passed: bool
     error_message: Optional[str] = None
     timed_out: bool = False
-
-
-@dataclass
-class FeedbackResult:
-    feedback_text: str
-    success: bool
-    metadata: Optional[Dict[str, Any]] = None
 
 
 def extract_python_code(text: str) -> str:

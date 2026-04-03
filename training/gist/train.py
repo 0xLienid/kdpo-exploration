@@ -1,29 +1,29 @@
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from data.livecodebench import format_question as get_question
 from training.opsd.EMATeacher import EMATeacher
 from training.train import (
     Hparams,
     StepContext,
-    ValidatorRunConfig,
-    train as run_train,
 )
 from training.utils import (
-    build_student_messages,
-    build_insight_teacher_messages,
-    build_insight_prompt,
     gather_completion_span,
     get_logits_completion_ids_and_mask,
 )
 
 
 logger = logging.getLogger(__name__)
+
+RolloutFn = Callable[..., List[Dict[str, Any]]]
+FeedbackFn = Callable[[str, Dict[str, Any]], Any]
+StudentMessagesFn = Callable[[Dict[str, Any], str], List[Dict[str, Any]]]
+InsightPromptFn = Callable[[Dict[str, Any], str, Any], List[Dict[str, Any]]]
+InsightTeacherMessagesFn = Callable[[Dict[str, Any], str, str], List[Dict[str, Any]]]
 
 
 @dataclass
@@ -81,6 +81,7 @@ def insight_rollout(
     example: Dict[str, Any],
     rollouts: List[Any],
     feedbacks: List[Any],
+    build_insight_prompt_fn: InsightPromptFn,
     temperature: float = 1.0,
     max_new_tokens: int = 2048,
 ) -> List[Dict[str, Any]]:
@@ -90,9 +91,8 @@ def insight_rollout(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    question = f"{example['question_title']}:\n{example['question_content']}"
     prompts = [
-        build_insight_prompt(question, rollout["completion"], feedback.feedback_text)
+        build_insight_prompt_fn(example, rollout["completion"], feedback)
         for rollout, feedback in zip(rollouts, feedbacks)
     ]
     inputs = tokenizer.apply_chat_template(
@@ -138,8 +138,11 @@ def forward(
     tokenizer: AutoTokenizer,
     hparams: GISTHparams,
     auxiliary_model: Any,
-    rollout_fn: Callable,
-    get_feedback_fn: Callable,
+    rollout_fn: RolloutFn,
+    get_feedback_fn: FeedbackFn,
+    build_student_messages_fn: StudentMessagesFn,
+    build_insight_prompt_fn: InsightPromptFn,
+    build_insight_teacher_messages_fn: InsightTeacherMessagesFn,
 ) -> Optional[Dict[str, Any]]:
     batch_data = []
     unwrapped_model = accelerator.unwrap_model(model)
@@ -162,6 +165,7 @@ def forward(
             example,
             rollouts,
             feedbacks,
+            build_insight_prompt_fn,
             temperature=hparams.temperature,
             max_new_tokens=hparams.max_response_length,
         )
@@ -180,8 +184,18 @@ def forward(
         return None
 
     model.train()
-    student_messages = [build_student_messages(get_question(data["example"]), data["rollout"]["completion"]) for data in batch_data]
-    teacher_messages = [build_insight_teacher_messages(get_question(data["example"]), data["teacher_insight"]["completion"], data["rollout"]["completion"]) for data in batch_data]
+    student_messages = [
+        build_student_messages_fn(data["example"], data["rollout"]["completion"])
+        for data in batch_data
+    ]
+    teacher_messages = [
+        build_insight_teacher_messages_fn(
+            data["example"],
+            data["teacher_insight"]["completion"],
+            data["rollout"]["completion"],
+        )
+        for data in batch_data
+    ]
 
     student_logits, completion_ids, student_starts, student_lengths = get_logits_completion_ids_and_mask(
         model,
@@ -229,8 +243,11 @@ def forward(
 
 
 def make_forward_backward_fn(
-    rollout_fn: Callable,
-    get_feedback_fn: Callable,
+    rollout_fn: RolloutFn,
+    get_feedback_fn: FeedbackFn,
+    build_student_messages_fn: StudentMessagesFn,
+    build_insight_prompt_fn: InsightPromptFn,
+    build_insight_teacher_messages_fn: InsightTeacherMessagesFn,
 ) -> Callable:
     def forward_backward(
         accelerator,
@@ -249,6 +266,9 @@ def make_forward_backward_fn(
             auxiliary_model,
             rollout_fn,
             get_feedback_fn,
+            build_student_messages_fn,
+            build_insight_prompt_fn,
+            build_insight_teacher_messages_fn,
         )
         if forward_outputs is None:
             return None, {}
@@ -270,118 +290,3 @@ def on_optimizer_step(context: StepContext) -> None:
     if context.auxiliary_model is None:
         return
     context.auxiliary_model.update(context.accelerator.unwrap_model(context.model))
-
-
-if __name__ == "__main__":
-    import argparse
-    import random
-
-    import numpy as np
-
-    from data.livecodebench import (
-        LiveCodeBenchDataset,
-        collate_fn as lcb_collate_fn,
-        get_environment_feedback as lcb_get_feedback,
-        rollout as lcb_rollout,
-    )
-    from validators import FineWebValidator, LiveCodeBenchValidator
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name", type=str, required=True)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--num-epochs", type=int, default=1)
-    parser.add_argument("--max-steps-per-epoch", type=int, default=None)
-    parser.add_argument("--minibatch-size", type=int, default=1)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
-    parser.add_argument("--num-rollouts", type=int, default=4)
-    parser.add_argument("--max-prompt-length", type=int, default=2048)
-    parser.add_argument("--max-response-length", type=int, default=8192)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--teacher-alpha", type=float, default=0.0)
-    parser.add_argument("--beta", type=float, default=0.1)
-    parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--validation-interval", type=int, default=10)
-    parser.add_argument("--output-dir", type=str, default="outputs/gist")
-    parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--wandb-run-name", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-
-    hparams = GISTHparams(
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        max_grad_norm=args.max_grad_norm,
-        num_epochs=args.num_epochs,
-        max_steps_per_epoch=args.max_steps_per_epoch,
-        minibatch_size=args.minibatch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_rollouts=args.num_rollouts,
-        max_prompt_length=args.max_prompt_length,
-        max_response_length=args.max_response_length,
-        top_k=args.top_k,
-        temperature=args.temperature,
-        teacher_alpha=args.teacher_alpha,
-        beta=args.beta,
-        log_interval=args.log_interval,
-        validation_interval=args.validation_interval,
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.bfloat16)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model.gradient_checkpointing_enable()
-
-    teacher = EMATeacher(model, alpha=hparams.teacher_alpha)
-    forward_backward_fn = make_forward_backward_fn(
-        lcb_rollout,
-        lcb_get_feedback,
-    )
-
-    dataset = LiveCodeBenchDataset()
-    validators = [
-        (
-            LiveCodeBenchValidator(),
-            ValidatorRunConfig(
-                batch_size=8,
-                max_new_tokens=2048,
-                max_seq_length=2048,
-            ),
-        ),
-        (
-            FineWebValidator(),
-            ValidatorRunConfig(
-                batch_size=8,
-                max_new_tokens=0,
-                max_seq_length=1024,
-            ),
-        ),
-    ]
-
-    run_train(
-        model=model,
-        tokenizer=tokenizer,
-        dataset=dataset,
-        hparams=hparams,
-        collate_fn=lcb_collate_fn,
-        forward_backward_fn=forward_backward_fn,
-        validators=validators,
-        on_optimizer_step_fn=on_optimizer_step,
-        auxiliary_model=teacher,
-        output_dir=args.output_dir,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-    )

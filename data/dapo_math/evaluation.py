@@ -2,6 +2,8 @@ import re
 from fractions import Fraction
 from typing import Any, Dict
 
+from data.feedback import FeedbackResult
+
 ANSWER_LINE_RE = re.compile(r"(?im)^\s*Answer:\s*(.+?)\s*$")
 INTEGER_RE = re.compile(r"^[+-]?\d[\d,]*$")
 FRACTION_RE = re.compile(r"^[+-]?\d[\d,]*/[+-]?\d[\d,]*$")
@@ -101,12 +103,37 @@ def normalize_math_answer(text: str) -> str:
     return re.sub(r"\s+", " ", candidate).strip().rstrip(".")
 
 
+def get_ground_truth(ground_truth_dict: Dict[str, Any] | str) -> str:
+    if isinstance(ground_truth_dict, dict):
+        return str(ground_truth_dict["ground_truth"])
+    return str(ground_truth_dict)
+
+
 def verify_answer(attempt: str, ground_truth_dict: Dict[str, Any] | str) -> bool:
     extracted_attempt = normalize_math_answer(extract_math_answer(attempt))
-    if isinstance(ground_truth_dict, dict):
-        ground_truth = ground_truth_dict["ground_truth"]
-    else:
-        ground_truth = ground_truth_dict
+    ground_truth = get_ground_truth(ground_truth_dict)
+    return extracted_attempt == normalize_math_answer(ground_truth)
 
-    return extracted_attempt == normalize_math_answer(str(ground_truth))
-    
+
+def get_environment_feedback(completion: str, example: Dict[str, Any]) -> FeedbackResult:
+    extracted_attempt = normalize_math_answer(extract_math_answer(completion))
+    ground_truth = get_ground_truth(example["reward_model"])
+    normalized_ground_truth = normalize_math_answer(ground_truth)
+    success = extracted_attempt == normalized_ground_truth
+
+    extracted_display = extracted_attempt if extracted_attempt else "[no final answer found]"
+    feedback_text = (
+        f"Verification result: {'CORRECT' if success else 'INCORRECT'}.\n"
+        f"Extracted final answer: {extracted_display}\n"
+        f"Correct answer: {ground_truth}"
+    )
+
+    return FeedbackResult(
+        feedback_text=feedback_text,
+        success=success,
+        metadata={
+            "extracted_answer": extracted_attempt,
+            "correct_answer": ground_truth,
+            "normalized_correct_answer": normalized_ground_truth,
+        },
+    )
