@@ -84,10 +84,12 @@ class LiveCodeBenchValidator(Validator):
                 if isinstance(private_test_cases, str):
                     private_test_cases = json.loads(private_test_cases)
 
+                all_test_cases = batch_data[j]["public_test_cases"] + private_test_cases
+
                 code = extract_python_code(completion)
 
                 all_passed, _ = run_test_cases(
-                    code, test_cases=private_test_cases, timeout_seconds=timeout_seconds)
+                    code, test_cases=all_test_cases, timeout_seconds=timeout_seconds)
                 if all_passed:
                     correct += 1
 
