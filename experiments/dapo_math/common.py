@@ -1,6 +1,7 @@
 import copy
 from typing import Any, Dict, List
 
+from data.feedback import noop_feedback
 from data.dapo_math import get_ground_truth
 from training.train import ValidatorRunConfig
 from validators import DAPOMathValidator, FineWebValidator
@@ -43,6 +44,31 @@ def build_teacher_messages(
                 f"## Correct Answer\n{correct_answer}\n\n"
                 "Correctly solve the original problem. Keep the reasoning "
                 "concise and end with a clear final answer."
+            ),
+        },
+        {"role": "assistant", "content": completion},
+    ]
+
+
+def build_gold_teacher_messages(
+    example: Dict[str, Any],
+    _student_attempt: str,
+    _feedback_text: str,
+    completion: str,
+) -> List[Dict[str, Any]]:
+    problem = _render_problem(example)
+    return [
+        {
+            "role": "user",
+            "content": (
+                "You are solving a math problem with access to a gold "
+                "standard reference solution.\n\n"
+                f"## Original Problem\n{problem}\n\n"
+                "## Gold Standard Solution\n"
+                f"{example['gold_standard']}\n\n"
+                "Use the gold standard solution as reference context while "
+                "solving the original problem. Keep the reasoning concise and "
+                "end with a clear final answer."
             ),
         },
         {"role": "assistant", "content": completion},
@@ -131,3 +157,14 @@ def make_validators() -> list[tuple[Any, ValidatorRunConfig]]:
             ),
         ),
     ]
+
+
+__all__ = [
+    "build_student_messages",
+    "build_teacher_messages",
+    "build_gold_teacher_messages",
+    "build_insight_prompt",
+    "build_insight_teacher_messages",
+    "make_validators",
+    "noop_feedback",
+]

@@ -1,5 +1,6 @@
 from typing import Any, Dict, List
 
+from data.feedback import noop_feedback
 from data.livecodebench import format_question
 from training.train import ValidatorRunConfig
 from validators import FineWebValidator, LiveCodeBenchValidator
@@ -39,6 +40,28 @@ def build_teacher_messages(
                 "## Feedback (from environment) for the previous attempt\n"
                 f"{feedback_text}\n\n"
                 "Correctly solve the original question."
+            ),
+        },
+        {"role": "assistant", "content": completion},
+    ]
+
+
+def build_gold_teacher_messages(
+    example: Dict[str, Any],
+    _student_attempt: str,
+    _feedback_text: str,
+    completion: str,
+) -> List[Dict[str, Any]]:
+    question = format_question(example)
+    return [
+        {
+            "role": "user",
+            "content": (
+                f"## Question\n{question}\n\n"
+                "## Gold Standard Solution\n"
+                f"{example['gold_standard']}\n\n"
+                "Use the gold standard solution as reference context while "
+                "solving the original question."
             ),
         },
         {"role": "assistant", "content": completion},
@@ -126,3 +149,14 @@ def make_validators() -> list[tuple[Any, ValidatorRunConfig]]:
             ),
         ),
     ]
+
+
+__all__ = [
+    "build_student_messages",
+    "build_teacher_messages",
+    "build_gold_teacher_messages",
+    "build_insight_prompt",
+    "build_insight_teacher_messages",
+    "make_validators",
+    "noop_feedback",
+]
