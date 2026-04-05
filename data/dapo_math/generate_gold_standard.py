@@ -8,7 +8,7 @@ load_dotenv()
 
 if __name__ == "__main__":
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    dataset = DAPOMathDataset(split="test", num_examples=2)
+    dataset = DAPOMathDataset(split="test", num_examples=32)
 
     dataset_with_gold_standard = []
     for example in dataset:

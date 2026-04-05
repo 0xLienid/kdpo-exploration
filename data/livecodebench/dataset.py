@@ -6,6 +6,7 @@ import base64
 from typing import List, Dict, Optional, Any
 from datasets import Dataset
 from huggingface_hub import hf_hub_download
+from dotenv import load_dotenv
 
 
 load_dotenv()

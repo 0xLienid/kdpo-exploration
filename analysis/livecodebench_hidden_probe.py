@@ -34,7 +34,7 @@ TOP_P = 0.95
 MAX_NEW_TOKENS = 2048
 PROBE_LEARNING_RATE = 1e-3
 PROBE_WEIGHT_DECAY = 0.0
-PROBE_LOSS = "mse"
+PROBE_LOSS = "cosine"
 
 
 def maybe_empty_cuda_cache() -> None:
@@ -296,9 +296,9 @@ def compute_probe_loss(
     target: torch.Tensor,
 ) -> torch.Tensor:
     if PROBE_LOSS == "mse":
-        return F.mse_loss(prediction, target)
+        return F.mse_loss(prediction.squeeze(0), target)
     if PROBE_LOSS == "cosine":
-        return 1.0 - F.cosine_similarity(prediction, target).mean()
+        return 1.0 - F.cosine_similarity(prediction.squeeze(0), target, dim=-1)
     raise ValueError(f"Unsupported probe loss: {PROBE_LOSS}")
 
 
@@ -457,6 +457,18 @@ def student_mode_step(
     return metrics
 
 
+class Probe(torch.nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, intermediate_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(intermediate_size, hidden_size),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["student", "teacher"])
@@ -495,7 +507,7 @@ def main() -> None:
         raise RuntimeError("LiveCodeBenchDataset is empty.")
 
     hidden_size = int(model.config.hidden_size)
-    probe = torch.nn.Linear(hidden_size, hidden_size, bias=True, device=device, dtype=torch.float32)
+    probe = Probe(hidden_size, intermediate_size=64).to(device)
     optimizer = torch.optim.AdamW(
         probe.parameters(),
         lr=PROBE_LEARNING_RATE,
@@ -548,8 +560,6 @@ def main() -> None:
 
     average_loss = sum(step["loss"] for step in step_metrics) / len(step_metrics)
     success_rate = sum(1 for step in step_metrics if step["feedback_success"]) / len(step_metrics)
-    probe_weight_norm = float(probe.weight.detach().norm().item())
-    probe_bias_norm = float(probe.bias.detach().norm().item())
 
     model_stub = args.model_name.replace("/", "_")
     output_stem = f"{args.mode}_{model_stub}_start{args.start_index}"
@@ -577,8 +587,6 @@ def main() -> None:
         "summary": {
             "average_loss": average_loss,
             "success_rate": success_rate,
-            "probe_weight_norm": probe_weight_norm,
-            "probe_bias_norm": probe_bias_norm,
             "probe_state_dict_path": str(probe_path),
         },
         "steps": step_metrics,
