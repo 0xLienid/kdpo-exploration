@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 from data.feedback import noop_feedback
 from data.dapo_math import get_ground_truth
 from training.train import ValidatorRunConfig
-from validators import DAPOMathValidator, FineWebValidator
+from validators import DAPOMathValidator, AIME2025Validator, FineWebValidator
 
 
 def _render_problem(example: Dict[str, Any]) -> str:
@@ -142,6 +142,14 @@ def make_validators() -> list[tuple[Any, ValidatorRunConfig]]:
     return [
         (
             DAPOMathValidator(),
+            ValidatorRunConfig(
+                batch_size=8,
+                max_new_tokens=2048,
+                max_seq_length=2048,
+            ),
+        ),
+        (
+            AIME2025Validator(),
             ValidatorRunConfig(
                 batch_size=8,
                 max_new_tokens=2048,
