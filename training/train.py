@@ -182,7 +182,7 @@ def train(
 
     for epoch in range(hparams.num_epochs):
         for step, batch in enumerate(dataloader):
-            if hparams.max_steps_per_epoch is not None and step >= hparams.max_steps_per_epoch:
+            if hparams.max_steps_per_epoch is not None and global_step >= hparams.max_steps_per_epoch:
                 break
 
             if accelerator.is_main_process:
